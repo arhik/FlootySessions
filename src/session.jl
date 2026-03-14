@@ -6,6 +6,7 @@ mutable struct Session <: AbstractSession
     root_agent::Union{AbstractAgent,Nothing}
     active_agent::Union{AbstractAgent,Nothing}
     workspace_folders::Vector{String}
+    tools::Vector{<:AbstractTool}
     metadata::Dict{String,Any}
     created_at::DateTime
     updated_at::DateTime
@@ -14,7 +15,8 @@ end
 # Constructor with defaults
 function Session(name::String; 
                  root_agent::Union{AbstractAgent,Nothing}=nothing,
-                 workspace_folders::Vector{String}=String[])
+                 workspace_folders::Vector{String}=String[],
+                 tools::Vector{<:AbstractTool}=AbstractTool[])
     now_time = now()
     Session(
         uuid4(),
@@ -23,6 +25,7 @@ function Session(name::String;
         root_agent,
         root_agent,  # active_agent defaults to root_agent
         workspace_folders,
+        tools,
         Dict{String,Any}(),
         now_time,
         now_time
@@ -42,6 +45,7 @@ FlootyAbstract.session_workspace(s::Session) = s.workspace_folders
 FlootyAbstract.session_context(s::Session) = s.metadata
 FlootyAbstract.session_created_at(s::Session) = s.created_at
 FlootyAbstract.session_updated_at(s::Session) = s.updated_at
+FlootyAbstract.session_tools(s::Session) = s.tools
 
 function FlootyAbstract.add_agent_to_session!(s::Session, agent::AbstractAgent)
     if s.root_agent === nothing
@@ -83,5 +87,13 @@ function FlootyAbstract.create_subagent_in_session!(s::Session, parent::Abstract
     subagent = create_subagent(parent, name, SimpleStack(max_messages=10), ""; kwargs...)
     s.updated_at = now()
     subagent
+end
+
+function set_active_agent!(s::Session, agent::AbstractAgent)
+    agents = session_agents(s)
+    agent in agents || throw(ArgumentError("Agent not in session"))
+    s.active_agent = agent
+    s.updated_at = now()
+    s
 end
 
