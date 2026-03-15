@@ -29,6 +29,10 @@ using InteractiveUtils
 
 @tachikoma_app
 
+# Import mouse enums for clarity
+using Tachikoma: mouse_left, mouse_middle, mouse_right, mouse_scroll_up, mouse_scroll_down
+using Tachikoma: mouse_press, mouse_release, mouse_drag, mouse_move
+
 # Debug logging to file (since @info doesn't show in TUI)
 const DEBUG_LOG = Ref{Union{IO,Nothing}}(nothing)
 function _init_debug_log!()
@@ -814,9 +818,10 @@ function _handle_mouse!(m::TuiModel, evt::MouseEvent)
     
     sidebar_width = m.layout_sidebar_width > 0 ? m.layout_sidebar_width : (m.show_sidebar ? 35 : 0)
     
-    _debug_log("Mouse: x=$(evt.x), y=$(evt.y), sidebar_width=$sidebar_width, chat_x=$(m.layout_chat_x), chat_width=$(m.layout_chat_width)")
+    _debug_log("Mouse: x=$(evt.x), y=$(evt.y), sidebar_width=$sidebar_width, chat_x=$(m.layout_chat_x), chat_width=$(m.layout_chat_width), action=$(evt.action), button=$(evt.button)")
     
-    if evt.action == :press && evt.button == 1  # Left click
+    # Use Tachikoma's MouseAction and MouseButton enums
+    if evt.action == mouse_press && evt.button == mouse_left
         if evt.x <= sidebar_width && evt.y >= 2  # Click in sidebar
             _debug_log("Click in sidebar")
             _handle_sidebar_click!(m, evt)
@@ -824,13 +829,15 @@ function _handle_mouse!(m::TuiModel, evt::MouseEvent)
             _debug_log("Click in chat area")
             _handle_chat_click!(m, evt, sidebar_width)
         end
-    elseif evt.action == :scroll_up
+    elseif evt.button == mouse_scroll_up && evt.action == mouse_press
+        _debug_log("Scroll up")
         if m.sidebar_focused
             m.session_list.selected = max(1, m.session_list.selected - 1)
         else
             m.scroll_offset = max(0, m.scroll_offset - 3)
         end
-    elseif evt.action == :scroll_down
+    elseif evt.button == mouse_scroll_down && evt.action == mouse_press
+        _debug_log("Scroll down")
         if m.sidebar_focused
             sessions = list_sessions(m.manager)
             m.session_list.selected = min(length(sessions), m.session_list.selected + 1)
@@ -896,16 +903,25 @@ function _handle_chat_click!(m::TuiModel, evt::MouseEvent, sidebar_width::Int)
     chat_x = m.layout_chat_x > 0 ? m.layout_chat_x : sidebar_width + 1
     content_width = m.layout_content_width > 0 ? m.layout_content_width : 50
     chat_y = m.layout_chat_y > 0 ? m.layout_chat_y : 1
+    chat_height = m.layout_chat_height > 0 ? m.layout_chat_height : 24
     
-    _debug_log("Chat click: x=$(evt.x), y=$(evt.y), chat_x=$chat_x, content_width=$content_width, chat_y=$chat_y")
+    _debug_log("Chat click: x=$(evt.x), y=$(evt.y), chat_x=$chat_x, content_width=$content_width, chat_y=$chat_y, chat_height=$chat_height, scroll_offset=$(m.scroll_offset)")
     
     # Check if click is within chat content area
     if evt.x < chat_x + 1
-        _debug_log("Click too far left")
+        _debug_log("Click too far left (x < $(chat_x + 1))")
         return
     end
     if evt.x > chat_x + content_width
-        _debug_log("Click in scrollbar area")
+        _debug_log("Click in scrollbar area (x > $(chat_x + content_width))")
+        return
+    end
+    if evt.y < chat_y
+        _debug_log("Click above chat area (y < $chat_y)")
+        return
+    end
+    if evt.y >= chat_y + chat_height
+        _debug_log("Click below chat area (y >= $(chat_y + chat_height))")
         return
     end
     
@@ -913,6 +929,10 @@ function _handle_chat_click!(m::TuiModel, evt::MouseEvent, sidebar_width::Int)
     context_messages = get_full_history(agent.context)
     
     # Find which message was clicked
+    # The visible area is from chat_y to chat_y + chat_height
+    # Messages are positioned at: chat_y - scroll_offset + cumulative_height
+    # We need to find which message contains evt.y in its visible portion
+    
     cumulative_height = 0
     clicked_idx = 0
     
@@ -923,15 +943,21 @@ function _handle_chat_click!(m::TuiModel, evt::MouseEvent, sidebar_width::Int)
                               msg_agent_name=agent.name)
         msg_height = _calculate_widget_height(widget)
         
-        # Check if click is in this message's visible area (accounting for scroll)
+        # Calculate message position (same as in _render_chat!)
         msg_y_start = chat_y - m.scroll_offset + cumulative_height
         msg_y_end = msg_y_start + msg_height
         
-        _debug_log("Message $i: y_start=$msg_y_start, y_end=$msg_y_end, evt.y=$(evt.y)")
+        # Check if message is visible and if click is inside it
+        msg_visible = msg_y_end > chat_y && msg_y_start < chat_y + chat_height
+        click_inside = evt.y >= msg_y_start && evt.y < msg_y_end
         
-        if evt.y >= msg_y_start && evt.y < msg_y_end
+        if msg_visible
+            _debug_log("Message $i: y=$msg_y_start-$msg_y_end, visible=$msg_visible, click_inside=$click_inside")
+        end
+        
+        if click_inside
             clicked_idx = i
-            _debug_log("Clicked message $i")
+            _debug_log("CLICKED message $i")
             break
         end
         cumulative_height += msg_height + 1  # +1 for spacing
@@ -942,9 +968,10 @@ function _handle_chat_click!(m::TuiModel, evt::MouseEvent, sidebar_width::Int)
         m.message_select_mode = true
         m.selected_message_idx = clicked_idx
         m.sidebar_focused = false
+        _set_status!(m, "Selected message $clicked_idx")
         _debug_log("Selected message $clicked_idx")
     else
-        _debug_log("No message clicked")
+        _debug_log("No message clicked (checked $(length(context_messages)) messages)")
     end
 end
 
