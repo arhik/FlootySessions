@@ -1269,30 +1269,38 @@ function view(m::TuiModel, f::Frame)
     
     _update_session_list!(m)
     
-    # Layout
+    # Layout: [chat] [activity] [input] [status]
     sidebar_width = m.show_sidebar ? 35 : 0
     chat_width = f.area.width - sidebar_width
     status_height = 1
+    activity_height = 1  # Background activity panel
     input_height = 3
+    
+    # Calculate areas from bottom up
+    status_y = f.area.y + f.area.height - status_height
+    input_y = status_y - input_height
+    activity_y = input_y - activity_height
+    chat_height = activity_y - f.area.y
     
     # Cache layout for mouse handling
     m.layout_sidebar_width = sidebar_width
-    m.layout_sidebar_y = f.area.y  # Sidebar starts at top of frame (1-based)
-    m.layout_card_width = sidebar_width - 2  # Cards have 2 less width for borders
+    m.layout_sidebar_y = f.area.y
+    m.layout_card_width = sidebar_width - 2
     m.layout_chat_x = f.area.x + sidebar_width
     m.layout_chat_width = chat_width
-    m.layout_content_width = chat_width - 1 - 2  # scrollbar - padding
+    m.layout_content_width = chat_width - 1 - 2
     m.layout_chat_y = f.area.y
-    m.layout_chat_height = f.area.height - status_height - input_height
+    m.layout_chat_height = chat_height
     
-    sidebar_area = Rect(f.area.x, f.area.y, sidebar_width, f.area.height - status_height - input_height)
-    chat_area = Rect(f.area.x + sidebar_width, f.area.y, chat_width, f.area.height - status_height - input_height)
-    input_area = Rect(f.area.x + sidebar_width, f.area.y + f.area.height - status_height - input_height, chat_width, input_height)
+    sidebar_area = Rect(f.area.x, f.area.y, sidebar_width, chat_height + activity_height + input_height)
+    chat_area = Rect(f.area.x + sidebar_width, f.area.y, chat_width, chat_height)
+    activity_area = Rect(f.area.x + sidebar_width, activity_y, chat_width, activity_height)
+    input_area = Rect(f.area.x + sidebar_width, input_y, chat_width, input_height)
     
     # Draw separator
     if m.show_sidebar
         sep_x = f.area.x + sidebar_width
-        sep_end_y = f.area.y + f.area.height - status_height - input_height - 1
+        sep_end_y = activity_y - 1
         for y in f.area.y:sep_end_y
             set_char!(buf, sep_x, y, '┃', SEPARATOR)
         end
@@ -1306,12 +1314,15 @@ function view(m::TuiModel, f::Frame)
     # Render chat
     _render_chat!(m, buf, chat_area)
     
+    # Render activity panel (spinner/status)
+    _render_activity_panel!(m, buf, activity_area)
+    
     # Render input
     _render_input!(m, buf, input_area)
     
     # Status bar
     status = _build_status(m)
-    set_string!(buf, f.area.x, f.area.y + f.area.height - 1, status, GREY_DIM)
+    set_string!(buf, f.area.x, status_y, status, GREY_DIM)
     
     # Render modal if active
     if m.modal != MODAL_NONE
@@ -1653,20 +1664,11 @@ function _render_input!(m::TuiModel, buf::Buffer, area::Rect)
         return
     end
     
-    # Show spinner if streaming
-    if m.streaming_session_id !== nothing
-        spinners = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
-        spinner_idx = (m.tick ÷ 5) % length(spinners) + 1
-        spinner_char = spinners[spinner_idx]
-        spinner_text = " $spinner_char Thinking..."
-        spinner_style = Style(bg=ColorRGB(60, 60, 60), fg=ColorRGB(150, 255, 150))
-        set_string!(buf, content_x + padding_left, area.y + padding_top, spinner_text, spinner_style)
-    end
-    
     # Set input style to match background (no background reset)
     m.input.style = input_style
     m.input.cursor_style = cursor_style
-    m.input.focused = !m.sidebar_focused && m.modal == MODAL_NONE && m.streaming_session_id === nothing
+    # Input is always enabled (can type even while streaming)
+    m.input.focused = !m.sidebar_focused && m.modal == MODAL_NONE
     m.input.tick = m.tick
     
     # Render input with internal padding
@@ -1677,6 +1679,24 @@ function _render_input!(m::TuiModel, buf::Buffer, area::Rect)
         area.height - padding_top - padding_bottom
     )
     render(m.input, inner_area, buf)
+end
+
+function _render_activity_panel!(m::TuiModel, buf::Buffer, area::Rect)
+    # Background activity panel - shows spinner only for CURRENT session
+    is_this_session_streaming = m.current_session !== nothing && m.streaming_session_id == m.current_session.id
+    if is_this_session_streaming
+        spinners = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+        spinner_idx = (m.tick ÷ 5) % length(spinners) + 1
+        spinner_char = spinners[spinner_idx]
+        
+        spinner_text = "$spinner_char Busy..."
+        # Green text, no background, with full padding (top, bottom, left, right)
+        spinner_style = Style(fg=ColorRGB(150, 255, 150))
+        # Apply padding: left=2, top=0 (centered vertically in 1-line area)
+        text_x = area.x + 2  # left padding
+        text_y = area.y + div(area.height - 1, 2)  # vertical center
+        set_string!(buf, text_x, text_y, spinner_text, spinner_style)
+    end
 end
 
 function _render_modal!(m::TuiModel, buf::Buffer, area::Rect)
