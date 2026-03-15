@@ -1718,9 +1718,9 @@ function _render_chat!(m::TuiModel, buf::Buffer, area::Rect)
     has_new_messages = current_message_count > m.last_message_count
     has_content_changed = content_hash != m.last_content_hash
     
+    # Don't auto-scroll if in message select mode (user is reviewing history)
     if m.scroll_offset < 0 ||              # User pressed End key
-       has_new_messages ||                 # New message arrived
-       has_content_changed                  # Message content changed (e.g., tool output)
+       has_new_messages                     # New message arrived
         m.scroll_offset = max(0, total_height - area.height)
     end
     
