@@ -514,6 +514,12 @@ end
     # Sidebar scrolling
     sidebar_scroll_offset::Int = 0  # Scroll offset for session list
     
+    # Message queue for when LLM is busy
+    message_queue::Vector{String} = String[]  # Queued messages to send when LLM is free
+    selected_queue_idx::Union{Int,Nothing} = nothing  # Selected queued message
+    queue_select_mode::Bool = false  # When true, navigating queued messages
+    queue_scroll_offset::Int = 0  # Scroll offset for queue panel
+    
     # Status notification
     status_message::String = ""
     status_ttl::Int = 0  # Frames remaining to show status
@@ -766,6 +772,69 @@ function _handle_key!(m::TuiModel, evt::KeyEvent)
         end
     end
     
+    # Queue selection mode (toggle with 'q' key when queue has items)
+    if evt.key == :char && evt.char == 'q' && !isempty(m.message_queue) && !m.sidebar_focused
+        m.queue_select_mode = !m.queue_select_mode
+        if m.queue_select_mode
+            # Enter queue select mode - select first item
+            m.selected_queue_idx = 1
+        else
+            # Exit select mode
+            m.selected_queue_idx = nothing
+        end
+        return
+    end
+    
+    # Queue navigation when in select mode
+    if m.queue_select_mode && m.selected_queue_idx !== nothing
+        if evt.key == :up
+            m.selected_queue_idx = max(1, m.selected_queue_idx - 1)
+            return
+        elseif evt.key == :down
+            m.selected_queue_idx = min(length(m.message_queue), m.selected_queue_idx + 1)
+            return
+        elseif evt.key == :pageup
+            m.selected_queue_idx = max(1, m.selected_queue_idx - 3)
+            m.queue_scroll_offset = max(0, m.queue_scroll_offset - 3)
+            return
+        elseif evt.key == :pagedown
+            m.selected_queue_idx = min(length(m.message_queue), m.selected_queue_idx + 3)
+            m.queue_scroll_offset = min(max(0, length(m.message_queue) - 3), m.queue_scroll_offset + 3)
+            return
+        elseif evt.key == :char && evt.char == 'c'
+            # Copy selected queued message
+            if m.selected_queue_idx <= length(m.message_queue)
+                try
+                    clipboard(m.message_queue[m.selected_queue_idx])
+                    _set_status!(m, "Copied queued message $m.selected_queue_idx")
+                catch e
+                    _set_status!(m, "Failed to copy: $e")
+                end
+            end
+            return
+        elseif evt.key == :char && evt.char == 'd'
+            # Delete selected queued message
+            if m.selected_queue_idx <= length(m.message_queue)
+                deleted_msg = splice!(m.message_queue, m.selected_queue_idx)
+                _set_status!(m, "Deleted: $(length(deleted_msg) > 20 ? deleted_msg[1:20]*"..." : deleted_msg)")
+                # Adjust selection
+                if isempty(m.message_queue)
+                    m.queue_select_mode = false
+                    m.selected_queue_idx = nothing
+                    m.queue_scroll_offset = 0
+                elseif m.selected_queue_idx > length(m.message_queue)
+                    m.selected_queue_idx = length(m.message_queue)
+                end
+            end
+            return
+        elseif evt.key == :escape
+            # Exit select mode
+            m.queue_select_mode = false
+            m.selected_queue_idx = nothing
+            return
+        end
+    end
+    
     # Sidebar navigation
     if m.sidebar_focused && m.show_sidebar
         handled = handle_key!(m.session_list, evt)
@@ -778,9 +847,26 @@ function _handle_key!(m::TuiModel, evt::KeyEvent)
     # Input handling
     if !m.sidebar_focused
         handled = handle_key!(m.input, evt)
-        if !handled && (String(m.input.buffer) |> strip |> !isempty) &&
-           (evt.key == :enter || (evt.key == :char && evt.char == '\n'))
-            _send_message!(m)
+        text = String(strip(String(m.input.buffer)))
+        if !handled && !isempty(text)
+            is_this_session_streaming = m.current_session !== nothing && m.streaming_session_id == m.current_session.id
+            
+            if evt.key == :enter || (evt.key == :char && evt.char == '\n')
+                if is_this_session_streaming
+                    # Queue message when Enter pressed while streaming
+                    push!(m.message_queue, text)
+                    empty!(m.input.buffer)
+                    m.input.cursor = 0
+                    _set_status!(m, "Message queued ($(length(m.message_queue)))")
+                else
+                    _send_message!(m)
+                end
+            elseif (evt.key == :shift_enter || (evt.shift && (evt.key == :enter || (evt.key == :char && evt.char == '\n')))) && is_this_session_streaming
+                # Shift+Enter to force send (cancel current and send new)
+                m.streaming_session_id = nothing  # Cancel current streaming
+                _send_message!(m)  # Send immediately
+                _set_status!(m, "Force sent (cancelled previous)")
+            end
         end
     end
 end
@@ -824,18 +910,33 @@ function _handle_modal_key!(m::TuiModel, evt::KeyEvent)
 end
 
 function _handle_mouse!(m::TuiModel, evt::MouseEvent)
-    # Handle mouse clicks in sidebar and chat
+    # Handle mouse clicks in sidebar, chat, and queue
     # MouseEvent has: x, y, button, action, shift, alt, ctrl
     
     sidebar_width = m.layout_sidebar_width > 0 ? m.layout_sidebar_width : (m.show_sidebar ? 35 : 0)
     
     _debug_log("Mouse: x=$(evt.x), y=$(evt.y), sidebar_width=$sidebar_width, chat_x=$(m.layout_chat_x), chat_width=$(m.layout_chat_width), action=$(evt.action), button=$(evt.button)")
     
+    # Calculate queue area Y position (from view function layout)
+    status_height = 1
+    input_height = 3
+    activity_height = 1
+    queue_height = isempty(m.message_queue) ? 0 : min(length(m.message_queue), 5)
+    
+    status_y = m.layout_chat_y + m.layout_chat_height + activity_height + queue_height + input_height
+    input_y = status_y - input_height
+    queue_y = input_y - queue_height
+    activity_y = queue_y - activity_height
+    
     # Use Tachikoma's MouseAction and MouseButton enums
     if evt.action == mouse_press && evt.button == mouse_left
-        if evt.x <= sidebar_width && evt.y >= 1  # Click in sidebar (y>=1 since no title)
+        if evt.x <= sidebar_width && evt.y >= 1  # Click in sidebar
             _debug_log("Click in SIDEBAR (x=$(evt.x) <= $sidebar_width)")
             _handle_sidebar_click!(m, evt)
+        elseif queue_height > 0 && evt.y >= queue_y && evt.y < queue_y + queue_height && evt.x > sidebar_width
+            # Click in queue area
+            _debug_log("Click in QUEUE (y=$(evt.y), queue_y=$queue_y, height=$queue_height)")
+            _handle_queue_click!(m, evt, sidebar_width, queue_y)
         else  # Click in chat area
             _debug_log("Click in CHAT (x=$(evt.x) > $sidebar_width)")
             _handle_chat_click!(m, evt, sidebar_width)
@@ -843,17 +944,16 @@ function _handle_mouse!(m::TuiModel, evt::MouseEvent)
     elseif evt.button == mouse_scroll_up && evt.action == mouse_press
         _debug_log("Scroll up")
         if m.sidebar_focused
-            # Scroll sidebar up
             m.sidebar_scroll_offset = max(0, m.sidebar_scroll_offset - 3)
+        elseif m.queue_select_mode && !isempty(m.message_queue)
+            m.queue_scroll_offset = max(0, m.queue_scroll_offset - 1)
         else
             m.scroll_offset = max(0, m.scroll_offset - 3)
         end
     elseif evt.button == mouse_scroll_down && evt.action == mouse_press
         _debug_log("Scroll down")
         if m.sidebar_focused
-            # Scroll sidebar down
             sessions = list_sessions(m.manager)
-            # Calculate total height
             total_height = 0
             active_id = m.manager.active_session_id
             for session in sessions
@@ -876,6 +976,8 @@ function _handle_mouse!(m::TuiModel, evt::MouseEvent)
             end
             sidebar_height = m.layout_chat_height > 0 ? m.layout_chat_height - 1 : 90
             m.sidebar_scroll_offset = min(max(0, total_height - sidebar_height), m.sidebar_scroll_offset + 3)
+        elseif m.queue_select_mode && !isempty(m.message_queue)
+            m.queue_scroll_offset = min(max(0, length(m.message_queue) - 5), m.queue_scroll_offset + 1)
         else
             m.scroll_offset += 3
         end
@@ -949,6 +1051,26 @@ function _handle_sidebar_click!(m::TuiModel, evt::MouseEvent)
         _debug_log("Switched to session $clicked_idx")
     else
         _debug_log("No session clicked (checked $(length(sessions)) sessions)")
+    end
+end
+
+function _handle_queue_click!(m::TuiModel, evt::MouseEvent, sidebar_width::Int, queue_y::Int)
+    isempty(m.message_queue) && return
+    
+    # Enter queue select mode
+    m.queue_select_mode = true
+    m.sidebar_focused = false
+    
+    # Calculate which item was clicked
+    clicked_idx = evt.y - queue_y + 1 + m.queue_scroll_offset
+    
+    _debug_log("Queue click: evt.y=$(evt.y), queue_y=$queue_y, scroll=$(m.queue_scroll_offset), clicked_idx=$clicked_idx")
+    
+    if clicked_idx >= 1 && clicked_idx <= length(m.message_queue)
+        m.selected_queue_idx = clicked_idx
+        _debug_log("Selected queue item $clicked_idx")
+    else
+        _debug_log("No queue item clicked")
     end
 end
 
@@ -1255,6 +1377,19 @@ function _send_message!(m::TuiModel)
             end
         end
         
+        # Process queued messages if any
+        if !isempty(m.message_queue) && m.current_session !== nothing && m.current_session.id == current_session_id
+            # Get next queued message
+            next_text = popfirst!(m.message_queue)
+            # Put it in input buffer and send
+            m.input.buffer = collect(UInt8, next_text)
+            m.input.cursor = length(next_text)
+            _set_status!(m, "Sending queued message ($(length(m.message_queue)) remaining)")
+            # Small delay to let UI update
+            sleep(0.1)
+            _send_message!(m)
+        end
+        
         # Trigger auto-save after message
         m.last_save = DateTime(0)  # Force save on next check
     end
@@ -1269,17 +1404,20 @@ function view(m::TuiModel, f::Frame)
     
     _update_session_list!(m)
     
-    # Layout: [chat] [activity] [input] [status]
+    # Layout: [chat] [activity] [queue] [input] [status]
     sidebar_width = m.show_sidebar ? 35 : 0
     chat_width = f.area.width - sidebar_width
     status_height = 1
     activity_height = 1  # Background activity panel
+    # Queue panel height = number of queued messages (max 5 to not take too much space)
+    queue_height = isempty(m.message_queue) ? 0 : min(length(m.message_queue), 5)
     input_height = 3
     
     # Calculate areas from bottom up
     status_y = f.area.y + f.area.height - status_height
     input_y = status_y - input_height
-    activity_y = input_y - activity_height
+    queue_y = input_y - queue_height
+    activity_y = queue_y - activity_height
     chat_height = activity_y - f.area.y
     
     # Cache layout for mouse handling
@@ -1292,9 +1430,10 @@ function view(m::TuiModel, f::Frame)
     m.layout_chat_y = f.area.y
     m.layout_chat_height = chat_height
     
-    sidebar_area = Rect(f.area.x, f.area.y, sidebar_width, chat_height + activity_height + input_height)
+    sidebar_area = Rect(f.area.x, f.area.y, sidebar_width, chat_height + activity_height + queue_height + input_height)
     chat_area = Rect(f.area.x + sidebar_width, f.area.y, chat_width, chat_height)
     activity_area = Rect(f.area.x + sidebar_width, activity_y, chat_width, activity_height)
+    queue_area = Rect(f.area.x + sidebar_width, queue_y, chat_width, queue_height)
     input_area = Rect(f.area.x + sidebar_width, input_y, chat_width, input_height)
     
     # Draw separator
@@ -1316,6 +1455,11 @@ function view(m::TuiModel, f::Frame)
     
     # Render activity panel (spinner/status)
     _render_activity_panel!(m, buf, activity_area)
+    
+    # Render queue panel (queued messages)
+    if queue_height > 0
+        _render_queue_panel!(m, buf, queue_area)
+    end
     
     # Render input
     _render_input!(m, buf, input_area)
@@ -1346,8 +1490,11 @@ function _build_status(m::TuiModel)::String
     
     parts = String[]
     
+    # Queue select mode indicator
+    if m.queue_select_mode
+        push!(parts, "[QUEUE MODE] Up/Down:nav c:copy d:delete Esc:exit")
     # Message select mode indicator
-    if m.message_select_mode
+    elseif m.message_select_mode
         push!(parts, "[SELECT MODE] Up/Down:nav c:copy d:delete Esc:exit")
     else
         if m.current_session !== nothing
@@ -1368,7 +1515,7 @@ function _build_status(m::TuiModel)::String
         
         m.streaming_session_id !== nothing && push!(parts, "⏳ streaming")
         
-        push!(parts, "F2:sidebar F3:new F4:delete F5:save F6:model F7:select End:bottom Ctrl+C:quit")
+        push!(parts, "F2:sidebar F3:new F4:delete F5:save F6:model F7:msg q:queue End:bottom Ctrl+C:quit")
     end
     
     join(parts, " | ")
@@ -1696,6 +1843,84 @@ function _render_activity_panel!(m::TuiModel, buf::Buffer, area::Rect)
         text_x = area.x + 2  # left padding
         text_y = area.y + div(area.height - 1, 2)  # vertical center
         set_string!(buf, text_x, text_y, spinner_text, spinner_style)
+    end
+end
+
+function _render_queue_panel!(m::TuiModel, buf::Buffer, area::Rect)
+    # Queue panel - shows all queued messages as cards like chat messages
+    # With scrolling support like chat arena
+    if isempty(m.message_queue)
+        return
+    end
+    
+    # Calculate total height
+    total_height = length(m.message_queue)
+    
+    # Auto-scroll to keep selected item visible
+    if m.queue_select_mode && m.selected_queue_idx !== nothing
+        if m.selected_queue_idx <= m.queue_scroll_offset
+            m.queue_scroll_offset = max(0, m.selected_queue_idx - 1)
+        elseif m.selected_queue_idx > m.queue_scroll_offset + area.height
+            m.queue_scroll_offset = min(max(0, total_height - area.height), m.selected_queue_idx - area.height)
+        end
+    end
+    
+    # Ensure scroll offset is valid
+    m.queue_scroll_offset = max(0, min(m.queue_scroll_offset, max(0, total_height - area.height)))
+    
+    # Render visible items
+    start_idx = m.queue_scroll_offset + 1
+    end_idx = min(length(m.message_queue), m.queue_scroll_offset + area.height)
+    
+    for i in start_idx:end_idx
+        y = area.y + (i - start_idx)
+        y >= bottom(area) && break
+        
+        msg = m.message_queue[i]
+        is_selected = m.queue_select_mode && m.selected_queue_idx == i
+        
+        # Colors: normal = grey, selected = brighter grey
+        if is_selected
+            bg_color = ColorRGB(80, 80, 80)  # Brighter when selected
+            fg_color = ColorRGB(255, 255, 255)
+            accent_color = ColorRGB(255, 255, 150)  # Brighter amber
+        else
+            bg_color = ColorRGB(60, 60, 60)  # Normal grey
+            fg_color = ColorRGB(255, 255, 255)
+            accent_color = ColorRGB(255, 200, 100)  # Amber
+        end
+        
+        # Truncate message if too long
+        display_msg = msg
+        max_len = area.width - 6  # Account for padding and number prefix
+        if length(display_msg) > max_len
+            display_msg = display_msg[1:max_len-3] * "..."
+        end
+        
+        # Number prefix: "1: message"
+        prefix = "$i: "
+        full_text = prefix * display_msg
+        
+        # Draw background for this queued message
+        base_style = Style(bg=bg_color, fg=fg_color)
+        for cx in area.x:(area.x + area.width - 1)
+            set_char!(buf, cx, y, ' ', base_style)
+        end
+        
+        # Draw left border (thicker when selected)
+        border_char = is_selected ? '▌' : '│'
+        border_style = Style(fg=accent_color, bg=bg_color)
+        set_char!(buf, area.x, y, border_char, border_style)
+        
+        # Draw text with padding
+        text_style = Style(bg=bg_color, fg=fg_color)
+        set_string!(buf, area.x + 2, y, full_text, text_style)
+    end
+    
+    # Render scrollbar if needed
+    if total_height > area.height
+        scrollbar_area = Rect(right(area) - 1, area.y, 1, area.height)
+        _render_scrollbar!(buf, scrollbar_area, m.queue_scroll_offset, total_height, area.height)
     end
 end
 
