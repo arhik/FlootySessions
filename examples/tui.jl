@@ -8,6 +8,7 @@
 #   F4               - Delete current session (with confirmation)
 #   F5               - Force save all sessions
 #   F6               - Select model for current session
+#   F7               - Toggle message select mode (copy/delete messages)
 #   Tab              - Switch focus (sidebar/chat/input)
 #   Enter            - Send message (when in input)
 #   Up/Down          - Navigate sessions or scroll chat
@@ -24,8 +25,25 @@ using FlootyPersistence
 using UUIDs
 using Dates
 using JSON3
+using InteractiveUtils
 
 @tachikoma_app
+
+# Debug logging to file (since @info doesn't show in TUI)
+const DEBUG_LOG = Ref{Union{IO,Nothing}}(nothing)
+function _init_debug_log!()
+    # Clear log on startup
+    DEBUG_LOG[] = open("/tmp/tui.log", "w")
+    println(DEBUG_LOG[], "[$(Dates.format(now(), "HH:MM:SS"))] TUI started")
+    flush(DEBUG_LOG[])
+end
+function _debug_log(msg::String)
+    if DEBUG_LOG[] === nothing
+        _init_debug_log!()
+    end
+    println(DEBUG_LOG[], "[$(Dates.format(now(), "HH:MM:SS"))] $msg")
+    flush(DEBUG_LOG[])
+end
 
 # ═══════════════════════════════════════════════════════════════════════
 # Configuration
@@ -60,10 +78,11 @@ mutable struct MessageWidget
     timestamp::Union{Float64, Nothing}
     model::Union{String, Nothing}
     msg_agent_name::Union{String, Nothing}  # Name of the agent that sent this message
+    is_selected::Bool  # Whether this message is selected for actions
     
     function MessageWidget(msg::AbstractMessage, agent_name::String, width::Int; 
-                          timestamp=nothing, model=nothing, msg_agent_name=nothing)
-        new(msg, agent_name, width, timestamp, model, msg_agent_name)
+                          timestamp=nothing, model=nothing, msg_agent_name=nothing, is_selected=false)
+        new(msg, agent_name, width, timestamp, model, msg_agent_name, is_selected)
     end
 end
 
@@ -80,21 +99,37 @@ function render_widget(buf::Buffer, widget::MessageWidget, x::Int, y::Int, max_y
     padding_left = 2
     padding_right = 2
     
-    # Determine base style
-    base_style = if msg_role == "user"
-        Style(bg=ColorRGB(60, 60, 60), fg=ColorRGB(255, 255, 255))
-    elseif msg_role == "assistant"
-        Style(bg=ColorRGB(40, 40, 60), fg=ColorRGB(200, 200, 255))
-    elseif msg_role == "tool"
-        # Tool messages: start as assistant (purple), change to green/red based on result
-        # Check if output contains error
-        if occursin("\nError:", msg_content) || startswith(msg_content, "Error:")
-            Style(bg=ColorRGB(80, 40, 40), fg=ColorRGB(255, 200, 200))  # Red for error
+    # Determine base style - brighter when selected
+    base_style = if widget.is_selected
+        # Selected state - brighter/highlighted
+        if msg_role == "user"
+            Style(bg=ColorRGB(80, 80, 80), fg=ColorRGB(255, 255, 255))
+        elseif msg_role == "assistant"
+            Style(bg=ColorRGB(60, 60, 100), fg=ColorRGB(220, 220, 255))
+        elseif msg_role == "tool"
+            if occursin("\nError:", msg_content) || startswith(msg_content, "Error:")
+                Style(bg=ColorRGB(120, 60, 60), fg=ColorRGB(255, 220, 220))
+            else
+                Style(bg=ColorRGB(60, 120, 60), fg=ColorRGB(220, 255, 220))
+            end
         else
-            Style(bg=ColorRGB(40, 80, 40), fg=ColorRGB(200, 255, 200))  # Green for success
+            Style(bg=ColorRGB(100, 80, 60), fg=ColorRGB(255, 240, 200))
         end
     else
-        Style(bg=ColorRGB(80, 60, 40), fg=ColorRGB(255, 220, 180))
+        # Normal state
+        if msg_role == "user"
+            Style(bg=ColorRGB(60, 60, 60), fg=ColorRGB(255, 255, 255))
+        elseif msg_role == "assistant"
+            Style(bg=ColorRGB(40, 40, 60), fg=ColorRGB(200, 200, 255))
+        elseif msg_role == "tool"
+            if occursin("\nError:", msg_content) || startswith(msg_content, "Error:")
+                Style(bg=ColorRGB(80, 40, 40), fg=ColorRGB(255, 200, 200))
+            else
+                Style(bg=ColorRGB(40, 80, 40), fg=ColorRGB(200, 255, 200))
+            end
+        else
+            Style(bg=ColorRGB(80, 60, 40), fg=ColorRGB(255, 220, 180))
+        end
     end
     
     # Calculate dimensions
@@ -452,6 +487,22 @@ end
     last_content_hash::UInt = 0  # Track content changes for auto-scroll
     session_list::SelectableList = SelectableList(String[]; focused=false)
     
+    # Message selection for actions
+    selected_message_idx::Union{Int,Nothing} = nothing  # Index of selected message (1-based)
+    message_select_mode::Bool = false  # When true, Up/Down navigate messages instead of sessions
+    
+    # Layout cache for mouse handling (updated in view, used in mouse handler)
+    layout_sidebar_width::Int = 0
+    layout_chat_x::Int = 0
+    layout_chat_width::Int = 0
+    layout_content_width::Int = 0
+    layout_chat_y::Int = 0
+    layout_chat_height::Int = 0
+    
+    # Status notification
+    status_message::String = ""
+    status_ttl::Int = 0  # Frames remaining to show status
+    
     # Modal state
     modal::ModalState = MODAL_NONE
     modal_input::TextInput = TextInput(text="", focused=true, tick=0)
@@ -583,6 +634,7 @@ function update!(m::TuiModel, evt::Event)
     if evt isa KeyEvent
         _handle_key!(m, evt)
     elseif evt isa MouseEvent
+        _debug_log("MouseEvent: x=$(evt.x), y=$(evt.y), button=$(evt.button), action=$(evt.action)")
         _handle_mouse!(m, evt)
     end
     
@@ -656,6 +708,49 @@ function _handle_key!(m::TuiModel, evt::KeyEvent)
         return
     end
     
+    # Message selection mode (toggle with F7 key)
+    if evt.key == :f7 && !m.sidebar_focused
+        m.message_select_mode = !m.message_select_mode
+        if m.message_select_mode
+            # Enter select mode - select last message
+            m.current_session === nothing && return
+            m.current_session.root_agent === nothing && return
+            context_messages = get_full_history(m.current_session.root_agent.context)
+            m.selected_message_idx = length(context_messages) > 0 ? length(context_messages) : nothing
+        else
+            # Exit select mode
+            m.selected_message_idx = nothing
+        end
+        return
+    end
+    
+    # Message navigation when in select mode
+    if m.message_select_mode && m.selected_message_idx !== nothing
+        if evt.key == :up
+            m.selected_message_idx = max(1, m.selected_message_idx - 1)
+            return
+        elseif evt.key == :down
+            m.current_session === nothing && return
+            m.current_session.root_agent === nothing && return
+            context_messages = get_full_history(m.current_session.root_agent.context)
+            m.selected_message_idx = min(length(context_messages), m.selected_message_idx + 1)
+            return
+        elseif evt.key == :char && evt.char == 'c'
+            # Copy selected message
+            _copy_selected_message!(m)
+            return
+        elseif evt.key == :char && evt.char == 'd'
+            # Delete selected message
+            _delete_selected_message!(m)
+            return
+        elseif evt.key == :escape
+            # Exit select mode
+            m.message_select_mode = false
+            m.selected_message_idx = nothing
+            return
+        end
+    end
+    
     # Sidebar navigation
     if m.sidebar_focused && m.show_sidebar
         handled = handle_key!(m.session_list, evt)
@@ -714,40 +809,20 @@ function _handle_modal_key!(m::TuiModel, evt::KeyEvent)
 end
 
 function _handle_mouse!(m::TuiModel, evt::MouseEvent)
-    # Handle mouse clicks in sidebar
+    # Handle mouse clicks in sidebar and chat
     # MouseEvent has: x, y, button, action, shift, alt, ctrl
     
+    sidebar_width = m.layout_sidebar_width > 0 ? m.layout_sidebar_width : (m.show_sidebar ? 35 : 0)
+    
+    _debug_log("Mouse: x=$(evt.x), y=$(evt.y), sidebar_width=$sidebar_width, chat_x=$(m.layout_chat_x), chat_width=$(m.layout_chat_width)")
+    
     if evt.action == :press && evt.button == 1  # Left click
-        # Check if click is in sidebar area
-        sidebar_width = m.show_sidebar ? 35 : 0
-        if evt.x <= sidebar_width && evt.y >= 2  # Below title
-            sessions = list_sessions(m.manager)
-            
-            # Calculate card height based on whether there's metadata
-            # Card height = padding(2) + title(1) + gap(1 if metadata) + metadata(1 if metadata)
-            card_start_y = 2
-            cumulative_height = 0
-            clicked_idx = 0
-            
-            for (i, session) in enumerate(sessions)
-                msg_count = session.root_agent !== nothing ? 
-                           length(get_messages(session.root_agent.context)) : 0
-                has_metadata = msg_count > 0
-                card_height = has_metadata ? 4 : 3  # 4 with metadata, 3 without
-                
-                if evt.y >= card_start_y + cumulative_height && 
-                   evt.y < card_start_y + cumulative_height + card_height
-                    clicked_idx = i
-                    break
-                end
-                cumulative_height += card_height + 1  # +1 for spacing between cards
-            end
-            
-            if clicked_idx >= 1 && clicked_idx <= length(sessions)
-                m.sidebar_focused = true
-                m.session_list.selected = clicked_idx
-                _switch_to_session!(m, clicked_idx)
-            end
+        if evt.x <= sidebar_width && evt.y >= 2  # Click in sidebar
+            _debug_log("Click in sidebar")
+            _handle_sidebar_click!(m, evt)
+        else  # Click in chat area
+            _debug_log("Click in chat area")
+            _handle_chat_click!(m, evt, sidebar_width)
         end
     elseif evt.action == :scroll_up
         if m.sidebar_focused
@@ -765,11 +840,218 @@ function _handle_mouse!(m::TuiModel, evt::MouseEvent)
     end
 end
 
+function _handle_sidebar_click!(m::TuiModel, evt::MouseEvent)
+    sessions = list_sessions(m.manager)
+    
+    _debug_log("Sidebar click: y=$(evt.y), $(length(sessions)) sessions")
+    
+    # Calculate card positions using actual CardWidget heights
+    card_start_y = 2
+    cumulative_height = 0
+    clicked_idx = 0
+    
+    for (i, session) in enumerate(sessions)
+        msg_count = session.root_agent !== nothing ? 
+                   length(get_messages(session.root_agent.context)) : 0
+        has_metadata = msg_count > 0
+        
+        # Build card to get actual height
+        card = CardWidget(
+            session.name, 33;  # sidebar width - 2 for borders
+            subtitle=nothing,
+            metadata=has_metadata ? "$msg_count messages" : nothing,
+            is_active=session.id == m.manager.active_session_id,
+            is_selected=m.session_list.selected == i,
+            card_type=:session
+        )
+        card_height = _calculate_card_height(card)
+        
+        card_y_start = card_start_y + cumulative_height
+        card_y_end = card_y_start + card_height
+        
+        _debug_log("Session $i: y=$card_y_start-$card_y_end, height=$card_height")
+        
+        if evt.y >= card_y_start && evt.y < card_y_end
+            clicked_idx = i
+            _debug_log("Clicked session $i")
+            break
+        end
+        cumulative_height += card_height + 1  # +1 for spacing
+    end
+    
+    if clicked_idx >= 1 && clicked_idx <= length(sessions)
+        m.sidebar_focused = true
+        m.session_list.selected = clicked_idx
+        _switch_to_session!(m, clicked_idx)
+    else
+        _debug_log("No session clicked")
+    end
+end
+
+function _handle_chat_click!(m::TuiModel, evt::MouseEvent, sidebar_width::Int)
+    m.current_session === nothing && return
+    m.current_session.root_agent === nothing && return
+    
+    # Use cached layout values
+    chat_x = m.layout_chat_x > 0 ? m.layout_chat_x : sidebar_width + 1
+    content_width = m.layout_content_width > 0 ? m.layout_content_width : 50
+    chat_y = m.layout_chat_y > 0 ? m.layout_chat_y : 1
+    
+    _debug_log("Chat click: x=$(evt.x), y=$(evt.y), chat_x=$chat_x, content_width=$content_width, chat_y=$chat_y")
+    
+    # Check if click is within chat content area
+    if evt.x < chat_x + 1
+        _debug_log("Click too far left")
+        return
+    end
+    if evt.x > chat_x + content_width
+        _debug_log("Click in scrollbar area")
+        return
+    end
+    
+    agent = m.current_session.root_agent
+    context_messages = get_full_history(agent.context)
+    
+    # Find which message was clicked
+    cumulative_height = 0
+    clicked_idx = 0
+    
+    for (i, ctx_msg) in enumerate(context_messages)
+        widget = MessageWidget(ctx_msg.message, agent.name, content_width;
+                              timestamp=ctx_msg.timestamp,
+                              model=agent.model,
+                              msg_agent_name=agent.name)
+        msg_height = _calculate_widget_height(widget)
+        
+        # Check if click is in this message's visible area (accounting for scroll)
+        msg_y_start = chat_y - m.scroll_offset + cumulative_height
+        msg_y_end = msg_y_start + msg_height
+        
+        _debug_log("Message $i: y_start=$msg_y_start, y_end=$msg_y_end, evt.y=$(evt.y)")
+        
+        if evt.y >= msg_y_start && evt.y < msg_y_end
+            clicked_idx = i
+            _debug_log("Clicked message $i")
+            break
+        end
+        cumulative_height += msg_height + 1  # +1 for spacing
+    end
+    
+    if clicked_idx >= 1 && clicked_idx <= length(context_messages)
+        # Enter message select mode and select clicked message
+        m.message_select_mode = true
+        m.selected_message_idx = clicked_idx
+        m.sidebar_focused = false
+        _debug_log("Selected message $clicked_idx")
+    else
+        _debug_log("No message clicked")
+    end
+end
+
+function _calculate_card_height(card::CardWidget)::Int
+    # Match render_card logic
+    padding_top = 1
+    padding_bottom = 1
+    
+    content_height = 1  # Title line
+    if card.subtitle !== nothing && !isempty(card.subtitle)
+        content_height += 1
+    end
+    
+    has_metadata = card.metadata !== nothing && !isempty(card.metadata)
+    gap_height = has_metadata ? 1 : 0
+    footer_height = has_metadata ? 1 : 0
+    
+    return padding_top + content_height + gap_height + footer_height + padding_bottom
+end
+
 function _open_delete_modal!(m::TuiModel)
     m.current_session === nothing && return
     m.modal = MODAL_DELETE_CONFIRM
     m.modal_selected = :cancel
     m.modal_message = "Delete session '$(m.current_session.name)'?"
+end
+
+function _set_status!(m::TuiModel, msg::String, ttl::Int=120)
+    m.status_message = msg
+    m.status_ttl = ttl
+end
+
+function _copy_selected_message!(m::TuiModel)
+    m.current_session === nothing && return
+    m.current_session.root_agent === nothing && return
+    m.selected_message_idx === nothing && return
+    
+    context_messages = get_full_history(m.current_session.root_agent.context)
+    m.selected_message_idx < 1 && return
+    m.selected_message_idx > length(context_messages) && return
+    
+    ctx_msg = context_messages[m.selected_message_idx]
+    msg_content = FlootyAbstract.content(ctx_msg.message)
+    msg_content === nothing && return
+    
+    # Copy to clipboard using InteractiveUtils
+    try
+        clipboard(msg_content)
+        _set_status!(m, "Copied to clipboard ($(length(msg_content)) chars)")
+    catch e
+        _set_status!(m, "Failed to copy: $e")
+    end
+    
+    # Exit select mode after copy
+    m.message_select_mode = false
+    m.selected_message_idx = nothing
+end
+
+function _delete_selected_message!(m::TuiModel)
+    m.current_session === nothing && return
+    m.current_session.root_agent === nothing && return
+    m.selected_message_idx === nothing && return
+    
+    context_messages = get_full_history(m.current_session.root_agent.context)
+    m.selected_message_idx < 1 && return
+    m.selected_message_idx > length(context_messages) && return
+    
+    _debug_log("Deleting message at index $(m.selected_message_idx) of $(length(context_messages))")
+    
+    # Get the ContextMessage to delete (this contains the actual message in the store)
+    ctx_msg = context_messages[m.selected_message_idx]
+    msg = ctx_msg.message
+    msg_role = FlootyAbstract.role(msg)
+    
+    _debug_log("Message role: $msg_role, message type: $(typeof(msg))")
+    
+    # Remove from context store directly
+    agent = m.current_session.root_agent
+    store = agent.context  # This is the ContextStore
+    
+    _debug_log("Total messages in store: $(length(store.messages))")
+    
+    # Find and remove the ContextMessage from the store's messages array
+    # Compare by the id since that's unique
+    idx = findfirst(cm -> cm.id == ctx_msg.id, store.messages)
+    
+    if idx !== nothing
+        _debug_log("Found ContextMessage at index $idx, deleting...")
+        deleteat!(store.messages, idx)
+        _set_status!(m, "Deleted $msg_role message")
+        _debug_log("Deleted successfully, new count: $(length(store.messages))")
+    else
+        _debug_log("ContextMessage not found in store!")
+        _set_status!(m, "Failed: message not found")
+    end
+    
+    # Update selection
+    new_count = length(context_messages) - 1
+    if m.selected_message_idx > new_count
+        m.selected_message_idx = new_count > 0 ? new_count : nothing
+        if m.selected_message_idx === nothing
+            m.message_select_mode = false
+        end
+    end
+    
+    # Save session
+    _auto_save!(m)
 end
 
 function _open_model_select_modal!(m::TuiModel)
@@ -909,6 +1191,14 @@ function view(m::TuiModel, f::Frame)
     status_height = 1
     input_height = 3
     
+    # Cache layout for mouse handling
+    m.layout_sidebar_width = sidebar_width
+    m.layout_chat_x = f.area.x + sidebar_width
+    m.layout_chat_width = chat_width
+    m.layout_content_width = chat_width - 1 - 2  # scrollbar - padding
+    m.layout_chat_y = f.area.y
+    m.layout_chat_height = f.area.height - status_height - input_height
+    
     sidebar_area = Rect(f.area.x, f.area.y, sidebar_width, f.area.height - status_height - input_height)
     chat_area = Rect(f.area.x + sidebar_width, f.area.y, chat_width, f.area.height - status_height - input_height)
     input_area = Rect(f.area.x + sidebar_width, f.area.y + f.area.height - status_height - input_height, chat_width, input_height)
@@ -944,27 +1234,45 @@ function view(m::TuiModel, f::Frame)
 end
 
 function _build_status(m::TuiModel)::String
+    # Decrement status TTL
+    if m.status_ttl > 0
+        m.status_ttl -= 1
+        if m.status_ttl == 0
+            m.status_message = ""
+        end
+    end
+    
+    # Show status message if active
+    if !isempty(m.status_message)
+        return m.status_message
+    end
+    
     parts = String[]
     
-    if m.current_session !== nothing
-        push!(parts, "Session: $(m.current_session.name)")
-        agent_count = length(session_agents(m.current_session))
-        push!(parts, "Agents: $agent_count")
+    # Message select mode indicator
+    if m.message_select_mode
+        push!(parts, "[SELECT MODE] Up/Down:nav c:copy d:delete Esc:exit")
     else
-        push!(parts, "No session")
+        if m.current_session !== nothing
+            push!(parts, "Session: $(m.current_session.name)")
+            agent_count = length(session_agents(m.current_session))
+            push!(parts, "Agents: $agent_count")
+        else
+            push!(parts, "No session")
+        end
+        
+        # Save status
+        seconds_since_save = Dates.value(now() - m.last_save) / 1000
+        if seconds_since_save < 5
+            push!(parts, "✓ saved")
+        else
+            push!(parts, "○ unsaved")
+        end
+        
+        m.streaming_session_id !== nothing && push!(parts, "⏳ streaming")
+        
+        push!(parts, "F2:sidebar F3:new F4:delete F5:save F6:model F7:select End:bottom Ctrl+C:quit")
     end
-    
-    # Save status
-    seconds_since_save = Dates.value(now() - m.last_save) / 1000
-    if seconds_since_save < 5
-        push!(parts, "✓ saved")
-    else
-        push!(parts, "○ unsaved")
-    end
-    
-    m.streaming_session_id !== nothing && push!(parts, "⏳ streaming")
-    
-    push!(parts, "F2:sidebar F3:new F4:delete F5:save F6:model End:bottom Ctrl+C:quit")
     
     join(parts, " | ")
 end
@@ -1077,11 +1385,13 @@ function _render_chat!(m::TuiModel, buf::Buffer, area::Rect)
     
     # Render messages with padding
     rendered_height = 0
-    for ctx_msg in context_messages
+    for (idx, ctx_msg) in enumerate(context_messages)
+        is_selected = m.message_select_mode && m.selected_message_idx == idx
         widget = MessageWidget(ctx_msg.message, agent.name, content_width;
                               timestamp=ctx_msg.timestamp,
                               model=agent.model,
-                              msg_agent_name=agent.name)
+                              msg_agent_name=agent.name,
+                              is_selected=is_selected)
         y = content_area.y - m.scroll_offset + rendered_height
         
         if y + _calculate_widget_height(widget) >= content_area.y && y < bottom(content_area)
