@@ -19,7 +19,7 @@ using FlootySessions: Session, SessionManager, set_active_agent!, SessionData
 using FlootyAgents
 using FlootyAgents: Agent, create_agent, descendants
 using FlootyAbstract
-using FlootyContextManager: add_message!, get_messages
+using FlootyContextManager: add_message!, get_messages, get_full_history
 using FlootyPersistence
 using UUIDs
 using Dates
@@ -57,9 +57,13 @@ mutable struct MessageWidget
     message::AbstractMessage
     agent_name::String
     width::Int
+    timestamp::Union{Float64, Nothing}
+    model::Union{String, Nothing}
+    msg_agent_name::Union{String, Nothing}  # Name of the agent that sent this message
     
-    function MessageWidget(msg::AbstractMessage, agent_name::String, width::Int)
-        new(msg, agent_name, width)
+    function MessageWidget(msg::AbstractMessage, agent_name::String, width::Int; 
+                          timestamp=nothing, model=nothing, msg_agent_name=nothing)
+        new(msg, agent_name, width, timestamp, model, msg_agent_name)
     end
 end
 
@@ -100,16 +104,45 @@ function render_widget(buf::Buffer, widget::MessageWidget, x::Int, y::Int, max_y
     lines = _wrap_lines(msg_content, content_width; preserve_whitespace=preserve_ws)
     content_height = length(lines)
     
-    # Calculate total height (header only for tool/system messages)
-    # Tool messages have header + separator line
-    header_height = if msg_role == "tool"
-        2  # header line + separator line
-    elseif msg_role == "system"
-        1
-    else
-        0
+    # Build metadata footer (dim style)
+    metadata_parts = String[]
+    
+    # Add timestamp if available
+    if widget.timestamp !== nothing
+        dt = Dates.unix2datetime(widget.timestamp)
+        time_str = Dates.format(dt, "HH:MM:SS")
+        push!(metadata_parts, time_str)
     end
-    total_height = padding_top + header_height + content_height + padding_bottom
+    
+    # Add agent name if available (for assistant/tool messages)
+    if widget.msg_agent_name !== nothing && !isempty(widget.msg_agent_name) && msg_role != "user"
+        push!(metadata_parts, widget.msg_agent_name)
+    end
+    
+    # Add model if available (for assistant messages)
+    if widget.model !== nothing && !isempty(widget.model) && msg_role == "assistant"
+        # Truncate model name if too long
+        model_str = length(widget.model) > 20 ? widget.model[1:20] * "..." : widget.model
+        push!(metadata_parts, model_str)
+    end
+    
+    metadata_text = join(metadata_parts, " · ")  # Use middle dot as subtle separator
+    has_metadata = !isempty(metadata_text)
+    
+    # Calculate total height
+    # Tool messages have command + separator + output
+    # All messages have optional metadata footer with gap
+    if msg_role == "tool"
+        # Tool: command + separator + output + gap + metadata
+        header_height = 2  # command line + separator
+    else
+        header_height = 0  # No header for other messages
+    end
+    
+    # Gap between content and metadata (1 line if metadata exists)
+    gap_height = has_metadata ? 1 : 0
+    footer_height = has_metadata ? 1 : 0
+    total_height = padding_top + header_height + content_height + gap_height + footer_height + padding_bottom
     
     # Fill entire widget background first (including all padding)
     for row_y in y:(y + total_height - 1)
@@ -119,14 +152,14 @@ function render_widget(buf::Buffer, widget::MessageWidget, x::Int, y::Int, max_y
         end
     end
     
-    # Header line (after top padding) - only show for tool/system messages
+    content_start_y = y + padding_top
+    
+    # Tool messages: show command header with separator
     if msg_role == "tool"
         # Parse tool name and args from first line of content
-        # Format: $ tool_name args\noutput
         header = "\$ tool"
         trimmed_content = strip(msg_content)
         if !isempty(trimmed_content) && startswith(trimmed_content, "\$")
-            # Extract tool call from first line
             first_newline = findfirst('\n', trimmed_content)
             if first_newline !== nothing
                 header = trimmed_content[1:first_newline-1]
@@ -134,36 +167,46 @@ function render_widget(buf::Buffer, widget::MessageWidget, x::Int, y::Int, max_y
                 header = trimmed_content
             end
         end
-        header_y = y + padding_top
+        
+        # Tool header style (same as content for seamless look)
+        header_y = content_start_y
         header_y >= max_y && return total_height
-        # Use same style as content for seamless background
         set_string!(buf, x + padding_left, header_y, header, base_style)
         
-        # Add separator line after tool header
+        # Add separator line after tool command
         sep_y = header_y + 1
         sep_y >= max_y && return total_height
         sep_width = widget.width - padding_left - padding_right
         separator = repeat("─", sep_width)
         set_string!(buf, x + padding_left, sep_y, separator, base_style)
         content_start_y = sep_y + 1
-    elseif msg_role == "system"
-        header = "[system]"
-        header_y = y + padding_top
-        header_y >= max_y && return total_height
-        set_string!(buf, x + padding_left, header_y, header, GREY_DIM)
-        content_start_y = header_y + 1
-    else
-        content_start_y = y + padding_top
     end
     
-    # Content lines (after header if present)
-    # For tool messages, skip the first line (it's the header we already displayed)
-    start_idx = msg_role == "tool" && length(lines) > 0 ? 2 : 1
-    for i in start_idx:length(lines)
+    # Content lines
+    for i in 1:length(lines)
         line = lines[i]
-        line_y = content_start_y + (i - start_idx)
-        line_y >= max_y - padding_bottom && break
+        line_y = content_start_y + (i - 1)
+        line_y >= max_y - padding_bottom - gap_height - footer_height && break
         set_string!(buf, x + padding_left, line_y, line, base_style)
+    end
+    
+    # Metadata footer (dim style) - with gap above it
+    if has_metadata
+        footer_y = y + total_height - padding_bottom - 1
+        footer_y >= max_y && return total_height
+        
+        # Dim style for metadata - darker text on same background
+        dim_style = if msg_role == "user"
+            Style(fg=ColorRGB(120, 120, 120), bg=ColorRGB(60, 60, 60))  # Darker grey
+        elseif msg_role == "assistant"
+            Style(fg=ColorRGB(100, 100, 140), bg=ColorRGB(40, 40, 60))  # Darker purple
+        elseif msg_role == "tool"
+            Style(fg=ColorRGB(100, 140, 100), bg=ColorRGB(40, 80, 40))  # Darker green
+        else
+            Style(fg=ColorRGB(140, 120, 100), bg=ColorRGB(80, 60, 40))  # Darker orange
+        end
+        
+        set_string!(buf, x + padding_left, footer_y, metadata_text, dim_style)
     end
     
     # Return total height
@@ -755,7 +798,8 @@ function _render_chat!(m::TuiModel, buf::Buffer, area::Rect)
     m.current_session.root_agent === nothing && return
     
     agent = m.current_session.root_agent
-    messages = get_messages(agent.context)
+    # Use get_full_history to get ContextMessage with timestamps
+    context_messages = get_full_history(agent.context)
     
     # Calculate scrollbar area (right side of chat)
     scrollbar_width = 1
@@ -765,8 +809,11 @@ function _render_chat!(m::TuiModel, buf::Buffer, area::Rect)
     
     # Calculate total content height
     total_height = 0
-    for msg in messages
-        widget = MessageWidget(msg, agent.name, content_width)
+    for ctx_msg in context_messages
+        widget = MessageWidget(ctx_msg.message, agent.name, content_width;
+                              timestamp=ctx_msg.timestamp,
+                              model=agent.model,
+                              msg_agent_name=agent.name)
         total_height += _calculate_widget_height(widget) + 1  # +1 for spacing
     end
     
@@ -777,8 +824,11 @@ function _render_chat!(m::TuiModel, buf::Buffer, area::Rect)
     
     # Render messages with padding
     rendered_height = 0
-    for msg in messages
-        widget = MessageWidget(msg, agent.name, content_width)
+    for ctx_msg in context_messages
+        widget = MessageWidget(ctx_msg.message, agent.name, content_width;
+                              timestamp=ctx_msg.timestamp,
+                              model=agent.model,
+                              msg_agent_name=agent.name)
         y = content_area.y - m.scroll_offset + rendered_height
         
         if y + _calculate_widget_height(widget) >= content_area.y && y < bottom(content_area)
@@ -795,9 +845,24 @@ end
 
 function _calculate_widget_height(widget::MessageWidget)::Int
     msg = widget.message
+    msg_role = role(msg)
     content_str = content(msg) === nothing ? "" : content(msg)
     lines = _wrap_lines(content_str, widget.width - 4)
-    return 1 + length(lines) + 2  # header + content lines + padding
+    
+    # Calculate height based on message type
+    padding = 2  # top + bottom
+    
+    # Tool messages have command + separator
+    header_height = msg_role == "tool" ? 2 : 0
+    
+    # Metadata footer if we have timestamp or other metadata
+    has_metadata = widget.timestamp !== nothing || 
+                    (widget.msg_agent_name !== nothing && msg_role != "user") ||
+                    (widget.model !== nothing && msg_role == "assistant")
+    gap_height = has_metadata ? 1 : 0  # Gap between content and metadata
+    footer_height = has_metadata ? 1 : 0
+    
+    return padding + header_height + length(lines) + gap_height + footer_height
 end
 
 function _render_scrollbar!(buf::Buffer, area::Rect, scroll_offset::Int, total_height::Int, viewport_height::Int)
