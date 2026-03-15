@@ -102,7 +102,13 @@ function render_widget(buf::Buffer, widget::MessageWidget, x::Int, y::Int, max_y
     # Preserve whitespace for tool messages (ls -l, etc.)
     preserve_ws = msg_role == "tool"
     lines = _wrap_lines(msg_content, content_width; preserve_whitespace=preserve_ws)
-    content_height = length(lines)
+    # Calculate content height with truncation for tool messages
+    # For tool messages, skip first line (already shown as header)
+    start_line = msg_role == "tool" ? 2 : 1
+    max_content_lines = msg_role == "tool" ? 10 : length(lines)
+    displayable_lines = max(0, length(lines) - start_line + 1)
+    is_truncated = displayable_lines > max_content_lines
+    content_height = min(displayable_lines, max_content_lines) + (is_truncated ? 1 : 0)  # +1 for truncation indicator
     
     # Build metadata footer (dim style)
     metadata_parts = String[]
@@ -127,7 +133,7 @@ function render_widget(buf::Buffer, widget::MessageWidget, x::Int, y::Int, max_y
     end
     
     metadata_text = join(metadata_parts, " · ")  # Use middle dot as subtle separator
-    has_metadata = !isempty(metadata_text)
+    has_metadata = !isempty(metadata_text) || is_truncated
     
     # Calculate total height
     # Tool messages have command + separator + output
@@ -182,18 +188,42 @@ function render_widget(buf::Buffer, widget::MessageWidget, x::Int, y::Int, max_y
         content_start_y = sep_y + 1
     end
     
-    # Content lines
-    for i in 1:length(lines)
+    # Content lines - with truncation for tool messages
+    # For tool messages, skip first line (already shown as header)
+    start_line = msg_role == "tool" ? 2 : 1
+    max_content_lines = msg_role == "tool" ? 10 : length(lines)
+    is_truncated = (length(lines) - start_line + 1) > max_content_lines
+    
+    line_idx = 0
+    for i in start_line:min(length(lines), start_line + max_content_lines - 1)
         line = lines[i]
-        line_y = content_start_y + (i - 1)
+        line_y = content_start_y + line_idx
+        line_idx += 1
         line_y >= max_y - padding_bottom - gap_height - footer_height && break
         set_string!(buf, x + padding_left, line_y, line, base_style)
     end
     
+    # Add truncation indicator if needed
+    if is_truncated
+        trunc_y = content_start_y + line_idx
+        if trunc_y < max_y - padding_bottom - gap_height - footer_height
+            total_output_lines = length(lines) - start_line + 1
+            trunc_text = "... ($(total_output_lines - max_content_lines) lines truncated)"
+            trunc_style = Style(fg=ColorRGB(150, 150, 150), bg=base_style.bg, italic=true)
+            set_string!(buf, x + padding_left, trunc_y, trunc_text, trunc_style)
+        end
+    end
+    
     # Metadata footer (dim style) - with gap above it
-    if has_metadata
+    if has_metadata || is_truncated
         footer_y = y + total_height - padding_bottom - 1
         footer_y >= max_y && return total_height
+        
+        # Add truncation info to metadata
+        if is_truncated
+            total_output_lines = length(lines) - start_line + 1
+            metadata_text = "$(total_output_lines - max_content_lines) more lines · " * metadata_text
+        end
         
         # Dim style for metadata - darker text on same background
         dim_style = if msg_role == "user"
@@ -223,10 +253,12 @@ function _wrap_lines(text::String, width::Int; preserve_whitespace::Bool=false)
             if length(line) <= width
                 push!(lines, line)
             else
-                # Hard wrap long lines
-                for i in 1:width:length(line)
-                    end_idx = min(i + width - 1, length(line))
-                    push!(lines, line[i:end_idx])
+                # Hard wrap long lines - use character indices, not byte indices
+                # Use first/last with ncodeunits for proper Unicode handling
+                chars = collect(line)
+                for i in 1:width:length(chars)
+                    end_idx = min(i + width - 1, length(chars))
+                    push!(lines, join(chars[i:end_idx]))
                 end
             end
         end
@@ -412,10 +444,12 @@ end
     current_session::Union{Session,Nothing} = nothing
     input::TextInput = TextInput(text="", focused=true, tick=0)
     task_queue::TaskQueue = TaskQueue()
-    is_streaming::Bool = false
+    streaming_session_id::Union{UUID,Nothing} = nothing  # Track which session is streaming
     show_sidebar::Bool = true
     sidebar_focused::Bool = false
     scroll_offset::Int = 0
+    last_message_count::Int = 0  # Track message count for auto-scroll
+    last_content_hash::UInt = 0  # Track content changes for auto-scroll
     session_list::SelectableList = SelectableList(String[]; focused=false)
     
     # Modal state
@@ -609,16 +643,7 @@ function _handle_key!(m::TuiModel, evt::KeyEvent)
         return
     end
     
-    # Sidebar navigation
-    if m.sidebar_focused && m.show_sidebar
-        handled = handle_key!(m.session_list, evt)
-        if handled
-            _switch_to_session!(m, m.session_list.selected)
-        end
-        return
-    end
-    
-    # Chat scroll
+    # Chat scroll (always works regardless of focus)
     if evt.key == :pageup
         m.scroll_offset = max(0, m.scroll_offset - 5)
         return
@@ -628,6 +653,15 @@ function _handle_key!(m::TuiModel, evt::KeyEvent)
     elseif evt.key == :end_key
         # Scroll to bottom (Ctrl+End or just End)
         m.scroll_offset = -1  # Will be recalculated in _render_chat!
+        return
+    end
+    
+    # Sidebar navigation
+    if m.sidebar_focused && m.show_sidebar
+        handled = handle_key!(m.session_list, evt)
+        if handled
+            _switch_to_session!(m, m.session_list.selected)
+        end
         return
     end
     
@@ -814,7 +848,10 @@ function _send_message!(m::TuiModel)
     
     empty!(m.input.buffer)
     m.input.cursor = 0
-    m.is_streaming = true
+    current_session_id = m.current_session.id
+    m.streaming_session_id = current_session_id
+    m.last_message_count = 0  # Reset to trigger auto-scroll when response arrives
+    m.last_content_hash = 0   # Reset content hash tracking
     
     result_channel = Channel{Any}(1)
     @async begin
@@ -828,7 +865,10 @@ function _send_message!(m::TuiModel)
     
     @async begin
         result = take!(result_channel)
-        m.is_streaming = false
+        # Only clear if still the same session (don't affect other sessions)
+        if m.streaming_session_id == current_session_id
+            m.streaming_session_id = nothing
+        end
         if result isa Exception
             prov = FlootyAbstract.provider(agent)
             add_message!(agent.context, 
@@ -922,7 +962,7 @@ function _build_status(m::TuiModel)::String
         push!(parts, "○ unsaved")
     end
     
-    m.is_streaming && push!(parts, "⏳ streaming")
+    m.streaming_session_id !== nothing && push!(parts, "⏳ streaming")
     
     push!(parts, "F2:sidebar F3:new F4:delete F5:save F6:model End:bottom Ctrl+C:quit")
     
@@ -948,10 +988,27 @@ function _render_sidebar!(m::TuiModel, buf::Buffer, area::Rect)
         is_active = session.id == active_id
         is_selected = m.sidebar_focused && m.session_list.selected == i
         
-        # Build metadata
+        # Build metadata with status indicator
         msg_count = session.root_agent !== nothing ? 
                    length(get_messages(session.root_agent.context)) : 0
-        metadata = "$(msg_count) messages"
+        
+        # Status indicator based on session state
+        status_indicator = ""
+        is_this_session_streaming = m.streaming_session_id == session.id
+        if is_this_session_streaming
+            # Animated spinner for streaming session
+            spinners = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+            spinner_idx = (m.tick ÷ 5) % length(spinners) + 1
+            status_indicator = string(spinners[spinner_idx]) * " "
+        elseif is_active
+            status_indicator = "● "  # Solid dot for active
+        elseif session.status == SESSION_PAUSED
+            status_indicator = "○ "  # Hollow dot for paused
+        else
+            status_indicator = "  "  # No indicator
+        end
+        
+        metadata = status_indicator * "$(msg_count) msgs"
         
         card = CardWidget(
             session.name,
@@ -983,24 +1040,40 @@ function _render_chat!(m::TuiModel, buf::Buffer, area::Rect)
     
     # Calculate scrollbar area (right side of chat)
     scrollbar_width = 1
-    content_width = area.width - scrollbar_width - 2  # -2 for padding
+    content_width = area.width - scrollbar_width - 2  # -2 for left/right padding
     content_area = Rect(area.x + 1, area.y, content_width, area.height)
     scrollbar_area = Rect(right(content_area), area.y, scrollbar_width, area.height)
     
-    # Calculate total content height
+    # Calculate total content height and content hash
     total_height = 0
+    content_hash = zero(UInt)
     for ctx_msg in context_messages
         widget = MessageWidget(ctx_msg.message, agent.name, content_width;
                               timestamp=ctx_msg.timestamp,
                               model=agent.model,
                               msg_agent_name=agent.name)
         total_height += _calculate_widget_height(widget) + 1  # +1 for spacing
+        # Hash the message content to detect changes
+        msg_content = FlootyAbstract.content(ctx_msg.message)
+        if msg_content !== nothing
+            content_hash = hash(msg_content, content_hash)
+        end
     end
     
-    # Auto-scroll to bottom if at end
-    if m.scroll_offset < 0 || m.scroll_offset + area.height >= total_height
+    # Auto-scroll to bottom on new messages, content changes, or End key
+    current_message_count = length(context_messages)
+    has_new_messages = current_message_count > m.last_message_count
+    has_content_changed = content_hash != m.last_content_hash
+    
+    if m.scroll_offset < 0 ||              # User pressed End key
+       has_new_messages ||                 # New message arrived
+       has_content_changed                  # Message content changed (e.g., tool output)
         m.scroll_offset = max(0, total_height - area.height)
     end
+    
+    # Update tracking for next frame
+    m.last_message_count = current_message_count
+    m.last_content_hash = content_hash
     
     # Render messages with padding
     rendered_height = 0
@@ -1027,22 +1100,35 @@ function _calculate_widget_height(widget::MessageWidget)::Int
     msg = widget.message
     msg_role = role(msg)
     content_str = content(msg) === nothing ? "" : content(msg)
-    lines = _wrap_lines(content_str, widget.width - 4)
+    # Match render_widget: use preserve_whitespace for tool messages
+    preserve_ws = msg_role == "tool"
+    lines = _wrap_lines(content_str, widget.width - 4; preserve_whitespace=preserve_ws)
     
     # Calculate height based on message type
-    padding = 2  # top + bottom
+    padding_top = 1
+    padding_bottom = 1
     
     # Tool messages have command + separator
     header_height = msg_role == "tool" ? 2 : 0
     
-    # Metadata footer if we have timestamp or other metadata
+    # Truncate tool messages to 10 lines (skip first line which is the command)
+    start_line = msg_role == "tool" ? 2 : 1
+    max_content_lines = msg_role == "tool" ? 10 : length(lines)
+    displayable_lines = max(0, length(lines) - start_line + 1)
+    is_truncated = displayable_lines > max_content_lines
+    content_height = min(displayable_lines, max_content_lines) + (is_truncated ? 1 : 0)
+    
+    # Metadata footer if we have timestamp or other metadata (or truncation)
     has_metadata = widget.timestamp !== nothing || 
                     (widget.msg_agent_name !== nothing && msg_role != "user") ||
-                    (widget.model !== nothing && msg_role == "assistant")
+                    (widget.model !== nothing && msg_role == "assistant") ||
+                    is_truncated
     gap_height = has_metadata ? 1 : 0  # Gap between content and metadata
     footer_height = has_metadata ? 1 : 0
     
-    return padding + header_height + length(lines) + gap_height + footer_height
+    total = padding_top + header_height + content_height + gap_height + footer_height + padding_bottom
+    
+    return total
 end
 
 function _render_scrollbar!(buf::Buffer, area::Rect, scroll_offset::Int, total_height::Int, viewport_height::Int)
