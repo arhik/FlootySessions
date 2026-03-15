@@ -255,6 +255,112 @@ function _wrap_lines(text::String, width::Int; preserve_whitespace::Bool=false)
 end
 
 # ═══════════════════════════════════════════════════════════════════════
+# Unified Card Widget - Used for both messages and sessions
+# ═══════════════════════════════════════════════════════════════════════
+mutable struct CardWidget
+    title::String
+    subtitle::Union{String,Nothing}
+    metadata::Union{String,Nothing}
+    width::Int
+    is_active::Bool
+    is_selected::Bool
+    card_type::Symbol  # :message_user, :message_assistant, :message_tool, :message_system, :session
+    
+    function CardWidget(title::String, width::Int; 
+                       subtitle=nothing, metadata=nothing, 
+                       is_active=false, is_selected=false, card_type=:session)
+        new(title, subtitle, metadata, width, is_active, is_selected, card_type)
+    end
+end
+
+function render_card(buf::Buffer, widget::CardWidget, x::Int, y::Int, max_y::Int)::Int
+    y >= max_y && return 0
+    
+    padding_top = 1
+    padding_bottom = 1
+    padding_left = 2
+    padding_right = 2
+    
+    # Determine colors based on card type and state
+    bg_color, fg_color, accent_color, meta_color = if widget.card_type == :message_user
+        (ColorRGB(60, 60, 60), ColorRGB(255, 255, 255), ColorRGB(180, 180, 180), ColorRGB(100, 100, 100))
+    elseif widget.card_type == :message_assistant
+        (ColorRGB(40, 40, 60), ColorRGB(200, 200, 255), ColorRGB(150, 150, 200), ColorRGB(80, 80, 120))
+    elseif widget.card_type == :message_tool
+        (ColorRGB(40, 80, 40), ColorRGB(200, 255, 200), ColorRGB(150, 200, 150), ColorRGB(80, 120, 80))
+    elseif widget.card_type == :message_system
+        (ColorRGB(80, 60, 40), ColorRGB(255, 220, 180), ColorRGB(200, 180, 150), ColorRGB(120, 100, 80))
+    elseif widget.card_type == :session
+        if widget.is_active
+            (ColorRGB(50, 50, 70), ColorRGB(255, 255, 100), ColorRGB(100, 255, 100), ColorRGB(80, 80, 100))
+        elseif widget.is_selected
+            (ColorRGB(50, 50, 50), ColorRGB(200, 200, 200), ColorRGB(150, 150, 150), ColorRGB(80, 80, 80))
+        else
+            (ColorRGB(40, 40, 40), ColorRGB(180, 180, 180), ColorRGB(100, 100, 100), ColorRGB(70, 70, 70))
+        end
+    else
+        (ColorRGB(50, 50, 50), ColorRGB(200, 200, 200), ColorRGB(150, 150, 150), ColorRGB(80, 80, 80))
+    end
+    
+    base_style = Style(bg=bg_color, fg=fg_color)
+    dim_style = Style(bg=bg_color, fg=accent_color)
+    meta_style = Style(bg=bg_color, fg=meta_color)  # Even dimmer for metadata
+    
+    # Calculate content
+    content_width = widget.width - padding_left - padding_right
+    lines = String[]
+    
+    # Title line - no arrow, just the title
+    push!(lines, widget.title)
+    
+    # Subtitle if present
+    if widget.subtitle !== nothing && !isempty(widget.subtitle)
+        push!(lines, widget.subtitle)
+    end
+    
+    content_height = length(lines)
+    has_metadata = widget.metadata !== nothing && !isempty(widget.metadata)
+    
+    # Calculate total height
+    gap_height = has_metadata ? 1 : 0
+    footer_height = has_metadata ? 1 : 0
+    total_height = padding_top + content_height + gap_height + footer_height + padding_bottom
+    
+    # Draw background
+    for row_y in y:(y + total_height - 1)
+        row_y >= max_y && break
+        for cx in x:(x + widget.width - 1)
+            set_char!(buf, cx, row_y, ' ', base_style)
+        end
+    end
+    
+    # Draw left border/accent
+    border_char = widget.is_active ? '▌' : '│'
+    border_style = widget.is_active ? Style(fg=accent_color, bg=bg_color) : Style(fg=ColorRGB(80, 80, 80), bg=bg_color)
+    for row_y in y:(y + total_height - 1)
+        row_y >= max_y && break
+        set_char!(buf, x, row_y, border_char, border_style)
+    end
+    
+    # Draw content
+    content_start_y = y + padding_top
+    for (i, line) in enumerate(lines)
+        line_y = content_start_y + (i - 1)
+        line_y >= max_y - padding_bottom - gap_height - footer_height && break
+        set_string!(buf, x + padding_left, line_y, line, i == 1 ? base_style : dim_style)
+    end
+    
+    # Draw metadata footer (very dim)
+    if has_metadata
+        footer_y = y + total_height - padding_bottom - 1
+        footer_y >= max_y && return total_height
+        set_string!(buf, x + padding_left, footer_y, widget.metadata, meta_style)
+    end
+    
+    return total_height
+end
+
+# ═══════════════════════════════════════════════════════════════════════
 # Persistence Functions
 # ═══════════════════════════════════════════════════════════════════════
 function save_all_sessions(manager::SessionManager, filepath::String)
@@ -574,7 +680,55 @@ function _handle_modal_key!(m::TuiModel, evt::KeyEvent)
 end
 
 function _handle_mouse!(m::TuiModel, evt::MouseEvent)
-    # TODO: Implement mouse support
+    # Handle mouse clicks in sidebar
+    # MouseEvent has: x, y, button, action, shift, alt, ctrl
+    
+    if evt.action == :press && evt.button == 1  # Left click
+        # Check if click is in sidebar area
+        sidebar_width = m.show_sidebar ? 35 : 0
+        if evt.x <= sidebar_width && evt.y >= 2  # Below title
+            sessions = list_sessions(m.manager)
+            
+            # Calculate card height based on whether there's metadata
+            # Card height = padding(2) + title(1) + gap(1 if metadata) + metadata(1 if metadata)
+            card_start_y = 2
+            cumulative_height = 0
+            clicked_idx = 0
+            
+            for (i, session) in enumerate(sessions)
+                msg_count = session.root_agent !== nothing ? 
+                           length(get_messages(session.root_agent.context)) : 0
+                has_metadata = msg_count > 0
+                card_height = has_metadata ? 4 : 3  # 4 with metadata, 3 without
+                
+                if evt.y >= card_start_y + cumulative_height && 
+                   evt.y < card_start_y + cumulative_height + card_height
+                    clicked_idx = i
+                    break
+                end
+                cumulative_height += card_height + 1  # +1 for spacing between cards
+            end
+            
+            if clicked_idx >= 1 && clicked_idx <= length(sessions)
+                m.sidebar_focused = true
+                m.session_list.selected = clicked_idx
+                _switch_to_session!(m, clicked_idx)
+            end
+        end
+    elseif evt.action == :scroll_up
+        if m.sidebar_focused
+            m.session_list.selected = max(1, m.session_list.selected - 1)
+        else
+            m.scroll_offset = max(0, m.scroll_offset - 3)
+        end
+    elseif evt.action == :scroll_down
+        if m.sidebar_focused
+            sessions = list_sessions(m.manager)
+            m.session_list.selected = min(length(sessions), m.session_list.selected + 1)
+        else
+            m.scroll_offset += 3
+        end
+    end
 end
 
 function _open_delete_modal!(m::TuiModel)
@@ -781,11 +935,37 @@ function _render_sidebar!(m::TuiModel, buf::Buffer, area::Rect)
     title_x = center(area, length(title), 1).x
     set_string!(buf, title_x, area.y, title, HIGHLIGHT)
     
-    # Session list
-    list_area = Rect(area.x, area.y + 2, area.width, area.height - 4)
-    m.session_list.tick = m.tick
-    m.session_list.focused = m.sidebar_focused
-    render(m.session_list, list_area, buf)
+    # Session cards
+    sessions = list_sessions(m.manager)
+    active_id = m.manager.active_session_id
+    
+    card_area = Rect(area.x + 1, area.y + 2, area.width - 2, area.height - 4)
+    y = card_area.y
+    
+    for (i, session) in enumerate(sessions)
+        y >= bottom(card_area) && break
+        
+        is_active = session.id == active_id
+        is_selected = m.sidebar_focused && m.session_list.selected == i
+        
+        # Build metadata
+        msg_count = session.root_agent !== nothing ? 
+                   length(get_messages(session.root_agent.context)) : 0
+        metadata = "$(msg_count) messages"
+        
+        card = CardWidget(
+            session.name,
+            card_area.width;
+            subtitle=nothing,
+            metadata=metadata,
+            is_active=is_active,
+            is_selected=is_selected,
+            card_type=:session
+        )
+        
+        h = render_card(buf, card, card_area.x, y, bottom(card_area))
+        y += h + 1  # +1 for spacing between cards
+    end
     
     # Help text at bottom
     help_y = bottom(area) - 2
