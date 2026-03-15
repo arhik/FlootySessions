@@ -353,6 +353,7 @@ function render_card(buf::Buffer, widget::CardWidget, x::Int, y::Int, max_y::Int
     padding_right = 2
     
     # Determine colors based on card type and state
+    # accent_color is used for the left border/handler
     bg_color, fg_color, accent_color, meta_color = if widget.card_type == :message_user
         (ColorRGB(60, 60, 60), ColorRGB(255, 255, 255), ColorRGB(180, 180, 180), ColorRGB(100, 100, 100))
     elseif widget.card_type == :message_assistant
@@ -362,12 +363,16 @@ function render_card(buf::Buffer, widget::CardWidget, x::Int, y::Int, max_y::Int
     elseif widget.card_type == :message_system
         (ColorRGB(80, 60, 40), ColorRGB(255, 220, 180), ColorRGB(200, 180, 150), ColorRGB(120, 100, 80))
     elseif widget.card_type == :session
+        # Sessions: all have handlers, active = green, inactive = light grey
         if widget.is_active
-            (ColorRGB(50, 50, 70), ColorRGB(255, 255, 100), ColorRGB(100, 255, 100), ColorRGB(80, 80, 100))
+            # Active: bright green handler
+            (ColorRGB(45, 45, 45), ColorRGB(220, 220, 220), ColorRGB(150, 255, 150), ColorRGB(100, 100, 100))
         elseif widget.is_selected
-            (ColorRGB(50, 50, 50), ColorRGB(200, 200, 200), ColorRGB(150, 150, 150), ColorRGB(80, 80, 80))
+            # Selected but not active: darker grey handler
+            (ColorRGB(40, 40, 40), ColorRGB(200, 200, 200), ColorRGB(100, 100, 100), ColorRGB(80, 80, 80))
         else
-            (ColorRGB(40, 40, 40), ColorRGB(180, 180, 180), ColorRGB(100, 100, 100), ColorRGB(70, 70, 70))
+            # Inactive: light grey handler
+            (ColorRGB(40, 40, 40), ColorRGB(180, 180, 180), ColorRGB(150, 150, 150), ColorRGB(70, 70, 70))
         end
     else
         (ColorRGB(50, 50, 50), ColorRGB(200, 200, 200), ColorRGB(150, 150, 150), ColorRGB(80, 80, 80))
@@ -406,8 +411,9 @@ function render_card(buf::Buffer, widget::CardWidget, x::Int, y::Int, max_y::Int
     end
     
     # Draw left border/accent
+    # Use accent_color for all states (active=bright, inactive=grey, selected=medium)
     border_char = widget.is_active ? '▌' : '│'
-    border_style = widget.is_active ? Style(fg=accent_color, bg=bg_color) : Style(fg=ColorRGB(80, 80, 80), bg=bg_color)
+    border_style = Style(fg=accent_color, bg=bg_color)
     for row_y in y:(y + total_height - 1)
         row_y >= max_y && break
         set_char!(buf, x, row_y, border_char, border_style)
@@ -497,11 +503,16 @@ end
     
     # Layout cache for mouse handling (updated in view, used in mouse handler)
     layout_sidebar_width::Int = 0
+    layout_sidebar_y::Int = 0  # Sidebar starts at this Y position
+    layout_card_width::Int = 0  # Card width (sidebar_width - 2 for borders)
     layout_chat_x::Int = 0
     layout_chat_width::Int = 0
     layout_content_width::Int = 0
     layout_chat_y::Int = 0
     layout_chat_height::Int = 0
+    
+    # Sidebar scrolling
+    sidebar_scroll_offset::Int = 0  # Scroll offset for session list
     
     # Status notification
     status_message::String = ""
@@ -822,25 +833,49 @@ function _handle_mouse!(m::TuiModel, evt::MouseEvent)
     
     # Use Tachikoma's MouseAction and MouseButton enums
     if evt.action == mouse_press && evt.button == mouse_left
-        if evt.x <= sidebar_width && evt.y >= 2  # Click in sidebar
-            _debug_log("Click in sidebar")
+        if evt.x <= sidebar_width && evt.y >= 1  # Click in sidebar (y>=1 since no title)
+            _debug_log("Click in SIDEBAR (x=$(evt.x) <= $sidebar_width)")
             _handle_sidebar_click!(m, evt)
         else  # Click in chat area
-            _debug_log("Click in chat area")
+            _debug_log("Click in CHAT (x=$(evt.x) > $sidebar_width)")
             _handle_chat_click!(m, evt, sidebar_width)
         end
     elseif evt.button == mouse_scroll_up && evt.action == mouse_press
         _debug_log("Scroll up")
         if m.sidebar_focused
-            m.session_list.selected = max(1, m.session_list.selected - 1)
+            # Scroll sidebar up
+            m.sidebar_scroll_offset = max(0, m.sidebar_scroll_offset - 3)
         else
             m.scroll_offset = max(0, m.scroll_offset - 3)
         end
     elseif evt.button == mouse_scroll_down && evt.action == mouse_press
         _debug_log("Scroll down")
         if m.sidebar_focused
+            # Scroll sidebar down
             sessions = list_sessions(m.manager)
-            m.session_list.selected = min(length(sessions), m.session_list.selected + 1)
+            # Calculate total height
+            total_height = 0
+            active_id = m.manager.active_session_id
+            for session in sessions
+                msg_count = session.root_agent !== nothing ? 
+                           length(get_messages(session.root_agent.context)) : 0
+                status_indicator = if m.streaming_session_id == session.id
+                    "⠋ "
+                elseif session.id == active_id
+                    "● "
+                elseif session.status == SESSION_PAUSED
+                    "○ "
+                else
+                    "  "
+                end
+                metadata = status_indicator * "$(msg_count) msgs"
+                card_width = m.layout_card_width > 0 ? m.layout_card_width : 33
+                card = CardWidget(session.name, card_width; subtitle=nothing, metadata=metadata,
+                                 is_active=session.id == active_id, is_selected=false, card_type=:session)
+                total_height += _calculate_card_height(card) + 1
+            end
+            sidebar_height = m.layout_chat_height > 0 ? m.layout_chat_height - 1 : 90
+            m.sidebar_scroll_offset = min(max(0, total_height - sidebar_height), m.sidebar_scroll_offset + 3)
         else
             m.scroll_offset += 3
         end
@@ -850,10 +885,12 @@ end
 function _handle_sidebar_click!(m::TuiModel, evt::MouseEvent)
     sessions = list_sessions(m.manager)
     
-    _debug_log("Sidebar click: y=$(evt.y), $(length(sessions)) sessions")
+    # Cards start at layout_sidebar_y (top of sidebar area, 1-based coordinates)
+    # Account for sidebar scroll offset
+    card_start_y = (m.layout_sidebar_y > 0 ? m.layout_sidebar_y : 1) - m.sidebar_scroll_offset
     
-    # Calculate card positions using actual CardWidget heights
-    card_start_y = 2
+    _debug_log("Sidebar click: evt.y=$(evt.y), sidebar_y=$(m.layout_sidebar_y), scroll=$(m.sidebar_scroll_offset), card_start_y=$card_start_y, $(length(sessions)) sessions")
+    
     cumulative_height = 0
     clicked_idx = 0
     
@@ -862,12 +899,31 @@ function _handle_sidebar_click!(m::TuiModel, evt::MouseEvent)
                    length(get_messages(session.root_agent.context)) : 0
         has_metadata = msg_count > 0
         
-        # Build card to get actual height
+        # Build card to get actual height (same as in _render_sidebar!)
+        # Use cached card width to ensure consistency with render
+        card_width = m.layout_card_width > 0 ? m.layout_card_width : 33
+        
+        # Match metadata format EXACTLY as in _render_sidebar!
+        is_active = session.id == m.manager.active_session_id
+        is_this_session_streaming = m.streaming_session_id == session.id
+        status_indicator = if is_this_session_streaming
+            spinners = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+            spinner_idx = (m.tick ÷ 5) % length(spinners) + 1
+            string(spinners[spinner_idx]) * " "
+        elseif is_active
+            "● "
+        elseif session.status == SESSION_PAUSED
+            "○ "
+        else
+            "  "
+        end
+        metadata = status_indicator * "$(msg_count) msgs"
+        
         card = CardWidget(
-            session.name, 33;  # sidebar width - 2 for borders
+            session.name, card_width;  # Use cached width for consistency
             subtitle=nothing,
-            metadata=has_metadata ? "$msg_count messages" : nothing,
-            is_active=session.id == m.manager.active_session_id,
+            metadata=metadata,
+            is_active=is_active,
             is_selected=m.session_list.selected == i,
             card_type=:session
         )
@@ -876,11 +932,11 @@ function _handle_sidebar_click!(m::TuiModel, evt::MouseEvent)
         card_y_start = card_start_y + cumulative_height
         card_y_end = card_y_start + card_height
         
-        _debug_log("Session $i: y=$card_y_start-$card_y_end, height=$card_height")
+        _debug_log("MOUSE session $i: y=$card_y_start-$card_y_end, height=$card_height, card_width=$card_width, name='$(session.name)'")
         
         if evt.y >= card_y_start && evt.y < card_y_end
             clicked_idx = i
-            _debug_log("Clicked session $i")
+            _debug_log("CLICKED session $i")
             break
         end
         cumulative_height += card_height + 1  # +1 for spacing
@@ -890,8 +946,9 @@ function _handle_sidebar_click!(m::TuiModel, evt::MouseEvent)
         m.sidebar_focused = true
         m.session_list.selected = clicked_idx
         _switch_to_session!(m, clicked_idx)
+        _debug_log("Switched to session $clicked_idx")
     else
-        _debug_log("No session clicked")
+        _debug_log("No session clicked (checked $(length(sessions)) sessions)")
     end
 end
 
@@ -1220,6 +1277,8 @@ function view(m::TuiModel, f::Frame)
     
     # Cache layout for mouse handling
     m.layout_sidebar_width = sidebar_width
+    m.layout_sidebar_y = f.area.y  # Sidebar starts at top of frame (1-based)
+    m.layout_card_width = sidebar_width - 2  # Cards have 2 less width for borders
     m.layout_chat_x = f.area.x + sidebar_width
     m.layout_chat_width = chat_width
     m.layout_content_width = chat_width - 1 - 2  # scrollbar - padding
@@ -1305,49 +1364,99 @@ function _build_status(m::TuiModel)::String
 end
 
 function _render_sidebar!(m::TuiModel, buf::Buffer, area::Rect)
-    # Title
-    title = " Sessions "
-    title_x = center(area, length(title), 1).x
-    set_string!(buf, title_x, area.y, title, HIGHLIGHT)
-    
-    # Session cards
+    # Session cards (start at top, no title)
     sessions = list_sessions(m.manager)
     active_id = m.manager.active_session_id
     
-    card_area = Rect(area.x + 1, area.y + 2, area.width - 2, area.height - 4)
-    y = card_area.y
+    # Calculate scrollbar area (right side of sidebar)
+    scrollbar_width = 1
+    card_width = area.width - scrollbar_width - 2  # -2 for left/right padding
+    card_area = Rect(area.x + 1, area.y, card_width, area.height - 1)  # -1 for title
+    scrollbar_area = Rect(right(card_area), area.y, scrollbar_width, area.height - 1)
     
-    for (i, session) in enumerate(sessions)
-        y >= bottom(card_area) && break
+    # Calculate total height of all sessions
+    total_height = 0
+    for session in sessions
+        msg_count = session.root_agent !== nothing ? 
+                   length(get_messages(session.root_agent.context)) : 0
+        has_metadata = msg_count > 0
+        status_indicator = if m.streaming_session_id == session.id
+            "⠋ "
+        elseif session.id == active_id
+            "● "
+        elseif session.status == SESSION_PAUSED
+            "○ "
+        else
+            "  "
+        end
+        metadata = status_indicator * "$(msg_count) msgs"
+        card = CardWidget(session.name, card_width; subtitle=nothing, metadata=metadata, 
+                         is_active=session.id == active_id, is_selected=false, card_type=:session)
+        total_height += _calculate_card_height(card) + 1  # +1 for spacing
+    end
+    
+    # Auto-scroll to keep selected session visible
+    if m.sidebar_focused && m.session_list.selected > 0
+        # Calculate position of selected session
+        selected_y = 0
+        for (i, session) in enumerate(sessions)
+            if i == m.session_list.selected
+                break
+            end
+            msg_count = session.root_agent !== nothing ? 
+                       length(get_messages(session.root_agent.context)) : 0
+            has_metadata = msg_count > 0
+            status_indicator = if m.streaming_session_id == session.id
+                "⠋ "
+            elseif session.id == active_id
+                "● "
+            elseif session.status == SESSION_PAUSED
+                "○ "
+            else
+                "  "
+            end
+            metadata = status_indicator * "$(msg_count) msgs"
+            card = CardWidget(session.name, card_width; subtitle=nothing, metadata=metadata,
+                             is_active=session.id == active_id, is_selected=false, card_type=:session)
+            selected_y += _calculate_card_height(card) + 1
+        end
         
+        # Adjust scroll to keep selected visible
+        if selected_y < m.sidebar_scroll_offset
+            m.sidebar_scroll_offset = selected_y
+        elseif selected_y + 5 > m.sidebar_scroll_offset + card_area.height
+            m.sidebar_scroll_offset = max(0, selected_y + 5 - card_area.height)
+        end
+    end
+    
+    # Render visible sessions
+    y = card_area.y - m.sidebar_scroll_offset
+    for (i, session) in enumerate(sessions)
         is_active = session.id == active_id
         is_selected = m.sidebar_focused && m.session_list.selected == i
         
-        # Build metadata with status indicator
         msg_count = session.root_agent !== nothing ? 
                    length(get_messages(session.root_agent.context)) : 0
         
-        # Status indicator based on session state
         status_indicator = ""
         is_this_session_streaming = m.streaming_session_id == session.id
         if is_this_session_streaming
-            # Animated spinner for streaming session
             spinners = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
             spinner_idx = (m.tick ÷ 5) % length(spinners) + 1
             status_indicator = string(spinners[spinner_idx]) * " "
         elseif is_active
-            status_indicator = "● "  # Solid dot for active
+            status_indicator = "● "
         elseif session.status == SESSION_PAUSED
-            status_indicator = "○ "  # Hollow dot for paused
+            status_indicator = "○ "
         else
-            status_indicator = "  "  # No indicator
+            status_indicator = "  "
         end
         
         metadata = status_indicator * "$(msg_count) msgs"
         
         card = CardWidget(
             session.name,
-            card_area.width;
+            card_width;
             subtitle=nothing,
             metadata=metadata,
             is_active=is_active,
@@ -1355,14 +1464,24 @@ function _render_sidebar!(m::TuiModel, buf::Buffer, area::Rect)
             card_type=:session
         )
         
-        h = render_card(buf, card, card_area.x, y, bottom(card_area))
-        y += h + 1  # +1 for spacing between cards
+        h = _calculate_card_height(card)
+        
+        # Only render if visible
+        if y + h > card_area.y && y < bottom(card_area)
+            render_card(buf, card, card_area.x, y, bottom(card_area))
+        end
+        y += h + 1
     end
     
-    # Help text at bottom
-    help_y = bottom(area) - 2
-    set_string!(buf, area.x + 1, help_y, "F3: New", GREY_DIM)
-    set_string!(buf, area.x + 1, help_y + 1, "F4: Delete", GREY_DIM)
+    # Render scrollbar
+    if total_height > card_area.height
+        _render_scrollbar!(buf, scrollbar_area, m.sidebar_scroll_offset, total_height, card_area.height)
+    end
+    
+    # Title at bottom with grey color
+    title = " Sessions "
+    title_x = center(area, length(title), 1).x
+    set_string!(buf, title_x, bottom(area) - 1, title, GREY_DIM)
 end
 
 function _render_chat!(m::TuiModel, buf::Buffer, area::Rect)
@@ -1534,10 +1653,20 @@ function _render_input!(m::TuiModel, buf::Buffer, area::Rect)
         return
     end
     
+    # Show spinner if streaming
+    if m.streaming_session_id !== nothing
+        spinners = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+        spinner_idx = (m.tick ÷ 5) % length(spinners) + 1
+        spinner_char = spinners[spinner_idx]
+        spinner_text = " $spinner_char Thinking..."
+        spinner_style = Style(bg=ColorRGB(60, 60, 60), fg=ColorRGB(150, 255, 150))
+        set_string!(buf, content_x + padding_left, area.y + padding_top, spinner_text, spinner_style)
+    end
+    
     # Set input style to match background (no background reset)
     m.input.style = input_style
     m.input.cursor_style = cursor_style
-    m.input.focused = !m.sidebar_focused && m.modal == MODAL_NONE
+    m.input.focused = !m.sidebar_focused && m.modal == MODAL_NONE && m.streaming_session_id === nothing
     m.input.tick = m.tick
     
     # Render input with internal padding
