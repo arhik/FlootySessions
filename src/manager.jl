@@ -74,7 +74,7 @@ function FlootyAbstract.close_session!(manager::SessionManager, session_id::UUID
         session = get(manager.sessions, session_id, nothing)
         if session !== nothing
             close_session(session)
-            delete!(manager.sessions, session_id)
+            Base.delete!(manager.sessions, session_id)
             if manager.active_session_id == session_id
                 manager.active_session_id = nothing
             end

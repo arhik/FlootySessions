@@ -8,7 +8,10 @@ Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 FlootyAbstract = "cebe1fc3-b0aa-42c6-ad50-daf6444249a8"
 FlootyAgents = "95131ab9-a123-4051-ae3d-83b8b4e06cf9"
 FlootyPermissions = "bb696aea-d332-4193-b638-9772a39ae69b"
+FlootyPersistence = "fef2fbbe-16ef-428b-8433-3c3d4a0a1e42"
+FlootyStreams = "6174e9c5-3b68-4377-bc3a-426e3f12d78b"
 FlootyWorkspaces = "8eaee756-10f8-4ffe-a99b-aa996c0071ce"
+StructTypes = "856f2bd8-1eba-4b0a-8007-ebc267875bd4"
 UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 
 [compat]
