@@ -20,7 +20,7 @@ using FlootySessions: Session, SessionManager, set_active_agent!, SessionData
 using FlootyAgents
 using FlootyAgents: Agent, create_agent, descendants
 using FlootyAbstract
-using FlootyContextManager: add_message!, get_messages, get_full_history
+using FlootyContextManager: add_message!, get_messages, get_full_history, ContextMessage
 using FlootyPersistence
 using UUIDs
 using Dates
@@ -86,10 +86,14 @@ mutable struct MessageWidget
     model::Union{String, Nothing}
     msg_agent_name::Union{String, Nothing}  # Name of the agent that sent this message
     is_selected::Bool  # Whether this message is selected for actions
+    is_editing::Bool   # Whether this message is being edited in-place
+    edit_text::String    # Text content for in-place editing
+    edit_cursor_row::Int   # Cursor row for TextArea
+    edit_cursor_col::Int   # Cursor column for TextArea
     
     function MessageWidget(msg::AbstractMessage, agent_name::String, width::Int; 
-                          timestamp=nothing, model=nothing, msg_agent_name=nothing, is_selected=false)
-        new(msg, agent_name, width, timestamp, model, msg_agent_name, is_selected)
+                          timestamp=nothing, model=nothing, msg_agent_name=nothing, is_selected=false, is_editing=false)
+        new(msg, agent_name, width, timestamp, model, msg_agent_name, is_selected, is_editing, "", 0, 0)
     end
 end
 
@@ -209,77 +213,105 @@ function render_widget(buf::Buffer, widget::MessageWidget, x::Int, y::Int, max_y
     
     content_start_y = y + padding_top
     
-    # Tool messages: show command header with separator
-    if msg_role == "tool"
-        # Parse tool name and args from first line of content
-        header = "\$ tool"
-        trimmed_content = strip(msg_content)
-        if !isempty(trimmed_content) && startswith(trimmed_content, "\$")
-            first_newline = findfirst('\n', trimmed_content)
-            if first_newline !== nothing
-                header = trimmed_content[1:first_newline-1]
-            else
-                header = trimmed_content
-            end
-        end
+    # In-place editing mode - use TextArea widget
+    if widget.is_editing
+        # Create a TextArea for editing
+        edit_area = TextArea(
+            text=String(widget.edit_text),
+            focused=true,
+            tick=0,
+            style=Style(bg=ColorRGB(80, 80, 80), fg=ColorRGB(255, 255, 255)),
+            cursor_style=Style(bg=ColorRGB(255, 255, 0), fg=ColorRGB(0, 0, 0))
+        )
         
-        # Tool header style (same as content for seamless look)
-        header_y = content_start_y
-        header_y >= max_y && return total_height
-        set_string!(buf, x + padding_left, header_y, header, base_style)
+        # Set cursor position
+        edit_area.cursor_row = widget.edit_cursor_row
+        edit_area.cursor_col = widget.edit_cursor_col
         
-        # Add separator line after tool command
-        sep_y = header_y + 1
-        sep_y >= max_y && return total_height
-        sep_width = widget.width - padding_left - padding_right
-        separator = repeat("─", sep_width)
-        set_string!(buf, x + padding_left, sep_y, separator, base_style)
-        content_start_y = sep_y + 1
-    end
-    
-    # Content lines - with truncation for tool messages
-    # For tool messages, skip first line (already shown as header)
-    start_line = msg_role == "tool" ? 2 : 1
-    max_content_lines = msg_role == "tool" ? 10 : length(lines)
-    is_truncated = (length(lines) - start_line + 1) > max_content_lines
-    
-    # Use markdown rendering for assistant messages
-    if msg_role == "assistant" && Tachikoma.markdown_extension_loaded()
-        # Render markdown content
-        md_lines = Tachikoma.markdown_to_spans(msg_content, content_width)
-        line_idx = 0
-        for md_line in md_lines
-            line_y = content_start_y + line_idx
-            line_idx += 1
-            line_y >= max_y - padding_bottom - gap_height - footer_height && break
-            # Render each span in the line
-            current_x = x + padding_left
-            for span in md_line
-                # Access Span fields directly
-                span_text = span.content
-                span_style = span.style
-                # Merge with base background
-                merged_style = Style(
-                    fg=span_style.fg,
-                    bg=base_style.bg,  # Keep message background
-                    bold=span_style.bold,
-                    dim=span_style.dim,
-                    italic=span_style.italic,
-                    underline=span_style.underline
-                )
-                set_string!(buf, current_x, line_y, span_text, merged_style)
-                current_x += length(span_text)
-            end
+        # Render TextArea in the message area
+        edit_rect = Rect(x + padding_left, content_start_y, content_width, content_height)
+        render(edit_area, edit_rect, buf)
+        
+        # Show edit hint below
+        hint_y = y + total_height - padding_bottom - 1
+        if hint_y < max_y
+            hint_text = "[EDITING] F9:save Esc:cancel"
+            hint_style = Style(fg=ColorRGB(255, 200, 100), bg=base_style.bg)
+            set_string!(buf, x + padding_left, hint_y, hint_text, hint_style)
         end
     else
-        # Standard text rendering for user/tool messages
-        line_idx = 0
-        for i in start_line:min(length(lines), start_line + max_content_lines - 1)
-            line = lines[i]
-            line_y = content_start_y + line_idx
-            line_idx += 1
-            line_y >= max_y - padding_bottom - gap_height - footer_height && break
-            set_string!(buf, x + padding_left, line_y, line, base_style)
+        # Tool messages: show command header with separator
+        if msg_role == "tool"
+            # Parse tool name and args from first line of content
+            header = "\$ tool"
+            trimmed_content = strip(msg_content)
+            if !isempty(trimmed_content) && startswith(trimmed_content, "\$")
+                first_newline = findfirst('\n', trimmed_content)
+                if first_newline !== nothing
+                    header = trimmed_content[1:first_newline-1]
+                else
+                    header = trimmed_content
+                end
+            end
+            
+            # Tool header style (same as content for seamless look)
+            header_y = content_start_y
+            header_y >= max_y && return total_height
+            set_string!(buf, x + padding_left, header_y, header, base_style)
+            
+            # Add separator line after tool command
+            sep_y = header_y + 1
+            sep_y >= max_y && return total_height
+            sep_width = widget.width - padding_left - padding_right
+            separator = repeat("─", sep_width)
+            set_string!(buf, x + padding_left, sep_y, separator, base_style)
+            content_start_y = sep_y + 1
+        end
+        
+        # Content lines - with truncation for tool messages
+        # For tool messages, skip first line (already shown as header)
+        start_line = msg_role == "tool" ? 2 : 1
+        max_content_lines = msg_role == "tool" ? 10 : length(lines)
+        is_truncated = (length(lines) - start_line + 1) > max_content_lines
+        
+        # Use markdown rendering for assistant messages
+        if msg_role == "assistant" && Tachikoma.markdown_extension_loaded()
+            # Render markdown content
+            md_lines = Tachikoma.markdown_to_spans(msg_content, content_width)
+            line_idx = 0
+            for md_line in md_lines
+                line_y = content_start_y + line_idx
+                line_idx += 1
+                line_y >= max_y - padding_bottom - gap_height - footer_height && break
+                # Render each span in the line
+                current_x = x + padding_left
+                for span in md_line
+                    # Access Span fields directly
+                    span_text = span.content
+                    span_style = span.style
+                    # Merge with base background
+                    merged_style = Style(
+                        fg=span_style.fg,
+                        bg=base_style.bg,  # Keep message background
+                        bold=span_style.bold,
+                        dim=span_style.dim,
+                        italic=span_style.italic,
+                        underline=span_style.underline
+                    )
+                    set_string!(buf, current_x, line_y, span_text, merged_style)
+                    current_x += length(span_text)
+                end
+            end
+        else
+            # Standard text rendering for user/tool messages
+            line_idx = 0
+            for i in start_line:min(length(lines), start_line + max_content_lines - 1)
+                line = lines[i]
+                line_y = content_start_y + line_idx
+                line_idx += 1
+                line_y >= max_y - padding_bottom - gap_height - footer_height && break
+                set_string!(buf, x + padding_left, line_y, line, base_style)
+            end
         end
     end
     
@@ -542,6 +574,11 @@ end
     selected_message_idx::Union{Int,Nothing} = nothing  # Index of selected message (1-based)
     message_select_mode::Bool = false  # When true, Up/Down navigate messages instead of sessions
     
+    # Message edit mode
+    edit_mode::Bool = false  # When true, editing selected message
+    edit_area::TextArea = TextArea(text="", focused=true, tick=0)  # TextArea for editing
+    editing_message_idx::Union{Int,Nothing} = nothing  # Index of message being edited
+    
     # Layout cache for mouse handling (updated in view, used in mouse handler)
     layout_sidebar_width::Int = 0
     layout_sidebar_y::Int = 0  # Sidebar starts at this Y position
@@ -720,7 +757,7 @@ function _handle_key!(m::TuiModel, evt::KeyEvent)
         return
     end
     
-    if evt.key == :f2
+    if evt.key == :f12
         m.show_sidebar = !m.show_sidebar
         return
     end
@@ -805,10 +842,35 @@ function _handle_key!(m::TuiModel, evt::KeyEvent)
             # Delete selected message
             _delete_selected_message!(m)
             return
+        elseif evt.key == :char && evt.char == 'e'
+            # Edit selected message
+            _start_edit_message!(m)
+            return
         elseif evt.key == :escape
             # Exit select mode
             m.message_select_mode = false
             m.selected_message_idx = nothing
+            return
+        end
+    end
+    
+    # Edit mode handling
+    if m.edit_mode && m.editing_message_idx !== nothing
+        # Check for save key first (F2 to save)
+        if evt.key == :f9
+            _save_edited_message!(m)
+            return
+        elseif evt.key == :escape
+            # Cancel edit
+            m.edit_mode = false
+            m.editing_message_idx = nothing
+            m.message_select_mode = true  # Return to select mode
+            return
+        end
+        
+        # Pass other keys to TextArea
+        handled = handle_key!(m.edit_area, evt)
+        if handled
             return
         end
     end
@@ -902,7 +964,7 @@ function _handle_key!(m::TuiModel, evt::KeyEvent)
                 else
                     _send_message!(m)
                 end
-            elseif (evt.key == :shift_enter || (evt.shift && (evt.key == :enter || (evt.key == :char && evt.char == '\n')))) && is_this_session_streaming
+            elseif evt.key == :shift_enter && is_this_session_streaming
                 # Shift+Enter to force send (cancel current and send new)
                 m.streaming_session_id = nothing  # Cancel current streaming
                 _send_message!(m)  # Send immediately
@@ -1301,6 +1363,116 @@ function _delete_selected_message!(m::TuiModel)
     _auto_save!(m)
 end
 
+function _start_edit_message!(m::TuiModel)
+    m.current_session === nothing && return
+    m.current_session.root_agent === nothing && return
+    m.selected_message_idx === nothing && return
+    
+    context_messages = get_full_history(m.current_session.root_agent.context)
+    m.selected_message_idx < 1 && return
+    m.selected_message_idx > length(context_messages) && return
+    
+    # Get the message to edit
+    ctx_msg = context_messages[m.selected_message_idx]
+    msg = ctx_msg.message
+    msg_content = FlootyAbstract.content(msg)
+    msg_content === nothing && return
+    
+    # Only allow editing user messages (not assistant/tool responses)
+    msg_role = FlootyAbstract.role(msg)
+    if msg_role != "user"
+        _set_status!(m, "Can only edit user messages")
+        return
+    end
+    
+    # Enter in-place edit mode
+    m.edit_mode = true
+    m.editing_message_idx = m.selected_message_idx
+    m.message_select_mode = false  # Exit select mode while editing
+    
+    # Initialize edit buffer with current message content
+    # TextArea expects lines as Vector{Vector{Char}}
+    if isempty(msg_content)
+        m.edit_area.lines = [Char[]]
+    else
+        m.edit_area.lines = [collect(line) for line in split(msg_content, '\n'; keepempty=true)]
+    end
+    m.edit_area.cursor_row = length(m.edit_area.lines)
+    m.edit_area.cursor_col = length(m.edit_area.lines[end])
+    
+    _set_status!(m, "In-place editing (F9:save Esc:cancel)")
+end
+
+function _save_edited_message!(m::TuiModel)
+    m.current_session === nothing && return
+    m.current_session.root_agent === nothing && return
+    m.editing_message_idx === nothing && return
+    
+    context_messages = get_full_history(m.current_session.root_agent.context)
+    m.editing_message_idx < 1 && return
+    m.editing_message_idx > length(context_messages) && return
+    
+    # Get the ContextMessage to edit
+    ctx_msg = context_messages[m.editing_message_idx]
+    msg = ctx_msg.message
+    
+    # Get the widget's edit text
+    widget = MessageWidget(msg, m.current_session.root_agent.name, 80; 
+                          is_editing=true, timestamp=ctx_msg.timestamp)
+    # Find the actual widget in the render cache or recreate
+    # For now, we'll use a simpler approach - get text from the message's widget if stored
+    # Actually, we need to store the edit text somewhere accessible
+    
+    # Since we can't easily access the widget's edit_text from here,
+    # let's store it in the model when editing
+    new_text = String(strip(join([String(l) for l in m.edit_area.lines], "\n")))
+    isempty(new_text) && return
+    
+    # Update the message content in the store
+    agent = m.current_session.root_agent
+    store = agent.context
+    
+    # Find the message in the store
+    idx = findfirst(cm -> cm.id == ctx_msg.id, store.messages)
+    if idx !== nothing
+        prov = FlootyAbstract.provider(agent)
+        
+        # Truncate history: keep messages BEFORE the edited one (1 to idx-1)
+        # Remove the old edited message and everything after it
+        num_removed = length(store.messages) - idx + 1
+        resize!(store.messages, idx - 1)
+        
+        # DON'T add the message here - let chat() add it
+        # This prevents duplicate messages
+        
+        _set_status!(m, "Message updated, history truncated ($num_removed messages removed), sending to LLM...")
+        _auto_save!(m)
+        
+        # Exit edit mode before triggering LLM response
+        m.edit_mode = false
+        m.editing_message_idx = nothing
+        empty!(m.edit_area.lines)
+        m.edit_area.cursor_row = 1; m.edit_area.cursor_col = 0
+        m.message_select_mode = false  # Exit select mode
+        m.selected_message_idx = nothing
+        
+        # Trigger LLM to respond - chat() will add the edited message
+        _trigger_llm_response!(m, new_text)
+        
+        return  # Early return
+    else
+        _set_status!(m, "Failed: message not found")
+    end
+    
+    # Exit edit mode (only reached on failure)
+    m.edit_mode = false
+    m.editing_message_idx = nothing
+    empty!(m.edit_area.lines)
+    m.edit_area.cursor_row = 1; m.edit_area.cursor_col = 0
+    m.message_select_mode = true  # Return to select mode
+    m.selected_message_idx = nothing
+end
+
 function _open_model_select_modal!(m::TuiModel)
     m.current_session === nothing && return
     m.modal = MODAL_MODEL_SELECT
@@ -1436,6 +1608,55 @@ function _send_message!(m::TuiModel)
     end
 end
 
+"""
+    _trigger_llm_response!(m::TuiModel, edited_text::String)
+
+Trigger the LLM to generate a response to the edited message.
+The edited message is sent to the LLM with the truncated history.
+"""
+function _trigger_llm_response!(m::TuiModel, edited_text::String)
+    m.current_session === nothing && return
+    m.current_session.root_agent === nothing && return
+    
+    agent = FlootySessions.get_active_agent(m.current_session)
+    agent === nothing && return
+    
+    current_session_id = m.current_session.id
+    m.streaming_session_id = current_session_id
+    m.last_message_count = 0
+    m.last_content_hash = 0
+    
+    result_channel = Channel{Any}(1)
+    @async begin
+        try
+            # Send the edited message text to get LLM response
+            # The agent's context already has the history up to before the edit
+            result = FlootyAbstract.chat(agent, edited_text; stream=false, auto_tools=true)
+            put!(result_channel, result)
+        catch e
+            put!(result_channel, e)
+        end
+    end
+    
+    @async begin
+        result = take!(result_channel)
+        if m.streaming_session_id == current_session_id
+            m.streaming_session_id = nothing
+        end
+        if result isa Exception
+            prov = FlootyAbstract.provider(agent)
+            add_message!(agent.context, 
+                create_message(prov, "system", "⚠️ Error: $(sprint(showerror, result))"))
+        elseif result isa FlootyAbstract.AbstractFlootyError
+            prov = FlootyAbstract.provider(agent)
+            add_message!(agent.context, 
+                create_message(prov, "system", "⚠️ Chat error: $(result.message)"))
+        end
+        
+        m.last_save = DateTime(0)
+    end
+end
+
 # ═══════════════════════════════════════════════════════════════════════
 # Rendering
 # ═══════════════════════════════════════════════════════════════════════
@@ -1502,7 +1723,7 @@ function view(m::TuiModel, f::Frame)
         _render_queue_panel!(m, buf, queue_area)
     end
     
-    # Render input
+    # Render input (edit mode is now in-place in the chat area)
     _render_input!(m, buf, input_area)
     
     # Status bar
@@ -1531,12 +1752,15 @@ function _build_status(m::TuiModel)::String
     
     parts = String[]
     
+    # Edit mode indicator
+    if m.edit_mode
+        push!(parts, "[EDIT MODE] Enter:save Esc:cancel")
     # Queue select mode indicator
-    if m.queue_select_mode
+    elseif m.queue_select_mode
         push!(parts, "[QUEUE MODE] Up/Down:nav c:copy d:delete Esc:exit")
     # Message select mode indicator
     elseif m.message_select_mode
-        push!(parts, "[SELECT MODE] Up/Down:nav c:copy d:delete Esc:exit")
+        push!(parts, "[SELECT MODE] Up/Down:nav c:copy d:delete e:edit Esc:exit")
     else
         if m.current_session !== nothing
             push!(parts, "Session: $(m.current_session.name)")
@@ -1732,11 +1956,22 @@ function _render_chat!(m::TuiModel, buf::Buffer, area::Rect)
     rendered_height = 0
     for (idx, ctx_msg) in enumerate(context_messages)
         is_selected = m.message_select_mode && m.selected_message_idx == idx
+        is_editing = m.edit_mode && m.editing_message_idx == idx
+        
         widget = MessageWidget(ctx_msg.message, agent.name, content_width;
                               timestamp=ctx_msg.timestamp,
                               model=agent.model,
                               msg_agent_name=agent.name,
-                              is_selected=is_selected)
+                              is_selected=is_selected,
+                              is_editing=is_editing)
+        
+        # If editing, populate the edit buffer from model's edit_area
+        if is_editing
+            # Join lines into a single String with newlines between
+            widget.edit_text = join([String(line) for line in m.edit_area.lines], "\n")
+            widget.edit_cursor_row = m.edit_area.cursor_row; widget.edit_cursor_col = m.edit_area.cursor_col
+        end
+        
         y = content_area.y - m.scroll_offset + rendered_height
         
         if y + _calculate_widget_height(widget) >= content_area.y && y < bottom(content_area)
@@ -1754,12 +1989,22 @@ end
 function _calculate_widget_height(widget::MessageWidget)::Int
     msg = widget.message
     msg_role = role(msg)
-    content_str = content(msg) === nothing ? "" : content(msg)
     content_width = widget.width - 4
     
     # Calculate height based on message type
     padding_top = 1
     padding_bottom = 1
+    
+    # In-place editing mode - use edit text for height calculation
+    if widget.is_editing
+        edit_str = String(widget.edit_text)
+        edit_lines = _wrap_lines(edit_str, content_width)
+        content_height = length(edit_lines)
+        # Add 1 for the hint line
+        return padding_top + content_height + 1 + padding_bottom
+    end
+    
+    content_str = content(msg) === nothing ? "" : content(msg)
     
     # Tool messages have command + separator
     header_height = msg_role == "tool" ? 2 : 0
@@ -1876,6 +2121,57 @@ function _render_input!(m::TuiModel, buf::Buffer, area::Rect)
         area.height - padding_top - padding_bottom
     )
     render(m.input, inner_area, buf)
+end
+
+function _render_edit_input!(m::TuiModel, buf::Buffer, area::Rect)
+    # Edit input - similar to regular input but with different styling
+    scrollbar_width = 1
+    left_padding = 1
+    right_padding = 1
+    
+    content_width = area.width - scrollbar_width - left_padding - right_padding
+    content_x = area.x + left_padding
+    
+    padding_top = 1
+    padding_bottom = 1
+    padding_left = 2
+    padding_right = 2
+    
+    # Edit mode style - slightly different to indicate editing
+    edit_style = Style(bg=ColorRGB(70, 70, 70), fg=ColorRGB(255, 255, 255))  # Slightly lighter
+    cursor_style = Style(bg=ColorRGB(150, 150, 100), fg=ColorRGB(255, 255, 255))  # Yellow-ish cursor
+    
+    # Fill background
+    content_area_y_start = area.y
+    content_area_y_end = area.y + area.height - 1
+    content_area_x_start = content_x
+    content_area_x_end = content_x + content_width - 1
+    
+    for y in content_area_y_start:content_area_y_end
+        for x in content_area_x_start:content_area_x_end
+            set_char!(buf, x, y, ' ', edit_style)
+        end
+    end
+    
+    # Show "EDITING" label at top
+    label = " [EDITING] "
+    label_style = Style(fg=ColorRGB(255, 200, 100), bold=true)
+    set_string!(buf, content_x + 2, area.y, label, label_style)
+    
+    # Set edit input style
+    m.edit_area.style = edit_style
+    m.edit_area.cursor_style = cursor_style
+    m.edit_area.focused = true
+    m.edit_area.tick = m.tick
+    
+    # Render edit input (below the label)
+    inner_area = Rect(
+        content_x + padding_left, 
+        area.y + padding_top + 1,  # +1 for label row
+        content_width - padding_left - padding_right, 
+        area.height - padding_top - padding_bottom - 1
+    )
+    render(m.edit_area, inner_area, buf)
 end
 
 function _render_activity_panel!(m::TuiModel, buf::Buffer, area::Rect)
