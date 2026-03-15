@@ -1476,6 +1476,31 @@ end
 function _open_model_select_modal!(m::TuiModel)
     m.current_session === nothing && return
     m.modal = MODAL_MODEL_SELECT
+    
+    # Fetch available models from the provider
+    agent = m.current_session.root_agent
+    if agent !== nothing
+        try
+            prov = FlootyAbstract.provider(agent)
+            provider_id = FlootyAbstract.provider_name(prov)
+            config = Dict{Symbol, Any}(:baseURL => prov.baseURL)
+            models = FlootyAbstract.list_provider_models(provider_id, config)
+            if !isempty(models)
+                # Extract model names from ModelInfo objects
+                model_names = [model.name for model in models]
+                m.available_models = model_names
+                _set_status!(m, "Fetched $(length(model_names)) models from $(provider_id)")
+            else
+                _set_status!(m, "No models found from provider")
+            end
+        catch e
+            # Keep existing hardcoded list if fetch fails
+            _set_status!(m, "Failed to fetch models: $(sprint(showerror, e))")
+        end
+    else
+        _set_status!(m, "No agent available to fetch models")
+    end
+    
     # Initialize model list with available models
     m.model_list = SelectableList(m.available_models; focused=true, tick=m.tick)
     # Select current model if present
