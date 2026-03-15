@@ -33,6 +33,9 @@ using InteractiveUtils
 using Tachikoma: mouse_left, mouse_middle, mouse_right, mouse_scroll_up, mouse_scroll_down
 using Tachikoma: mouse_press, mouse_release, mouse_drag, mouse_move
 
+# Enable markdown extension for rendering assistant messages
+Tachikoma.enable_markdown()
+
 # Debug logging to file (since @info doesn't show in TUI)
 const DEBUG_LOG = Ref{Union{IO,Nothing}}(nothing)
 function _init_debug_log!()
@@ -147,7 +150,14 @@ function render_widget(buf::Buffer, widget::MessageWidget, x::Int, y::Int, max_y
     max_content_lines = msg_role == "tool" ? 10 : length(lines)
     displayable_lines = max(0, length(lines) - start_line + 1)
     is_truncated = displayable_lines > max_content_lines
-    content_height = min(displayable_lines, max_content_lines) + (is_truncated ? 1 : 0)  # +1 for truncation indicator
+    
+    # For assistant messages with markdown, calculate height from markdown rendering
+    if msg_role == "assistant" && Tachikoma.markdown_extension_loaded()
+        md_lines = Tachikoma.markdown_to_spans(msg_content, content_width)
+        content_height = length(md_lines)
+    else
+        content_height = min(displayable_lines, max_content_lines) + (is_truncated ? 1 : 0)  # +1 for truncation indicator
+    end
     
     # Build metadata footer (dim style)
     metadata_parts = String[]
@@ -233,13 +243,44 @@ function render_widget(buf::Buffer, widget::MessageWidget, x::Int, y::Int, max_y
     max_content_lines = msg_role == "tool" ? 10 : length(lines)
     is_truncated = (length(lines) - start_line + 1) > max_content_lines
     
-    line_idx = 0
-    for i in start_line:min(length(lines), start_line + max_content_lines - 1)
-        line = lines[i]
-        line_y = content_start_y + line_idx
-        line_idx += 1
-        line_y >= max_y - padding_bottom - gap_height - footer_height && break
-        set_string!(buf, x + padding_left, line_y, line, base_style)
+    # Use markdown rendering for assistant messages
+    if msg_role == "assistant" && Tachikoma.markdown_extension_loaded()
+        # Render markdown content
+        md_lines = Tachikoma.markdown_to_spans(msg_content, content_width)
+        line_idx = 0
+        for md_line in md_lines
+            line_y = content_start_y + line_idx
+            line_idx += 1
+            line_y >= max_y - padding_bottom - gap_height - footer_height && break
+            # Render each span in the line
+            current_x = x + padding_left
+            for span in md_line
+                # Access Span fields directly
+                span_text = span.content
+                span_style = span.style
+                # Merge with base background
+                merged_style = Style(
+                    fg=span_style.fg,
+                    bg=base_style.bg,  # Keep message background
+                    bold=span_style.bold,
+                    dim=span_style.dim,
+                    italic=span_style.italic,
+                    underline=span_style.underline
+                )
+                set_string!(buf, current_x, line_y, span_text, merged_style)
+                current_x += length(span_text)
+            end
+        end
+    else
+        # Standard text rendering for user/tool messages
+        line_idx = 0
+        for i in start_line:min(length(lines), start_line + max_content_lines - 1)
+            line = lines[i]
+            line_y = content_start_y + line_idx
+            line_idx += 1
+            line_y >= max_y - padding_bottom - gap_height - footer_height && break
+            set_string!(buf, x + padding_left, line_y, line, base_style)
+        end
     end
     
     # Add truncation indicator if needed
@@ -1714,9 +1755,7 @@ function _calculate_widget_height(widget::MessageWidget)::Int
     msg = widget.message
     msg_role = role(msg)
     content_str = content(msg) === nothing ? "" : content(msg)
-    # Match render_widget: use preserve_whitespace for tool messages
-    preserve_ws = msg_role == "tool"
-    lines = _wrap_lines(content_str, widget.width - 4; preserve_whitespace=preserve_ws)
+    content_width = widget.width - 4
     
     # Calculate height based on message type
     padding_top = 1
@@ -1725,12 +1764,23 @@ function _calculate_widget_height(widget::MessageWidget)::Int
     # Tool messages have command + separator
     header_height = msg_role == "tool" ? 2 : 0
     
-    # Truncate tool messages to 10 lines (skip first line which is the command)
-    start_line = msg_role == "tool" ? 2 : 1
-    max_content_lines = msg_role == "tool" ? 10 : length(lines)
-    displayable_lines = max(0, length(lines) - start_line + 1)
-    is_truncated = displayable_lines > max_content_lines
-    content_height = min(displayable_lines, max_content_lines) + (is_truncated ? 1 : 0)
+    # Calculate content height
+    if msg_role == "assistant" && Tachikoma.markdown_extension_loaded()
+        # Use markdown rendering for assistant messages
+        md_lines = Tachikoma.markdown_to_spans(content_str, content_width)
+        content_height = length(md_lines)
+        is_truncated = false
+    else
+        # Match render_widget: use preserve_whitespace for tool messages
+        preserve_ws = msg_role == "tool"
+        lines = _wrap_lines(content_str, content_width; preserve_whitespace=preserve_ws)
+        # Truncate tool messages to 10 lines (skip first line which is the command)
+        start_line = msg_role == "tool" ? 2 : 1
+        max_content_lines = msg_role == "tool" ? 10 : length(lines)
+        displayable_lines = max(0, length(lines) - start_line + 1)
+        is_truncated = displayable_lines > max_content_lines
+        content_height = min(displayable_lines, max_content_lines) + (is_truncated ? 1 : 0)
+    end
     
     # Metadata footer if we have timestamp or other metadata (or truncation)
     has_metadata = widget.timestamp !== nothing || 
