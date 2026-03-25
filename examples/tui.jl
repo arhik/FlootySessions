@@ -1911,7 +1911,13 @@ function _send_message!(m::TuiModel)
                 # Get message count before chat
                 msg_count_before = length(get_messages(agent.context))
                 
+                _debug_log("Sending to chat (no attachments): text length=$(length(text))")
                 result = chat(agent, text; stream=false, auto_tools=true)
+                _debug_log("Chat response received: $(typeof(result))")
+                if result isa AbstractMessage || (hasproperty(result, :message) && result.message !== nothing)
+                    resp_content = content(result.message)
+                    _debug_log("Response content: $(resp_content)")
+                end
                 
                 # Update the user message metadata with the model used
                 # The user message should be at msg_count_before + 1
@@ -1952,7 +1958,13 @@ function _send_message!(m::TuiModel)
                 # Get message count before chat
                 msg_count_before = length(get_messages(agent.context))
                 
+                _debug_log("Sending to chat (with attachments): text length=$(length(text)), attachments=$(length(attachments))")
                 result = chat(agent, text, attachments; stream=false, auto_tools=true)
+                _debug_log("Chat response received: $(typeof(result))")
+                if result isa AbstractMessage || (hasproperty(result, :message) && result.message !== nothing)
+                    resp_content = content(result.message)
+                    _debug_log("Response content: $(resp_content)")
+                end
                 
                 # Update metadata with attachment info
                 # The user message should be at msg_count_before + 1
