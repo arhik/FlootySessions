@@ -1841,11 +1841,14 @@ function _generate_session_name(agent::Agent, first_message::String)::String
         prov = provider(agent)
         temp_agent = Agent("NamingAgent", prov; model=agent.model, tools=AbstractTool[])
         
+        _debug_log("_generate_session_name called with first_message length=$(length(first_message))")
         naming_prompt = """Suggest a concise session name (2-4 words) for a conversation that starts with this query: \"$first_message\"
 
 Reply with ONLY the name, no quotes or explanation. Keep it under 40 characters."""
         
+        _debug_log("Created temp_agent for naming")
         response = chat(temp_agent, naming_prompt; stream=false, auto_tools=false)
+        _debug_log("Naming chat completed")
         name = strip(content(response))
         
         # Clean up the name
@@ -1881,6 +1884,7 @@ function _send_message!(m::TuiModel)
     current_model = agent.model
     
     is_first_message = isempty(get_messages(agent.context))
+    _debug_log("_send_message: is_first_message=$is_first_message, msg_count=$(length(get_messages(agent.context)))")
     
     # Save attachment info before clearing
     attachment_info = [(path=att.path, is_url=att.is_url, mime=att.mime_type) for att in m.attachments]
@@ -1988,8 +1992,11 @@ function _send_message!(m::TuiModel)
         end
         
         # Auto-rename session after first message exchange
+        _debug_log("Checking auto-rename: is_first_message=$is_first_message")
         if is_first_message && m.current_session !== nothing
+            _debug_log("Calling _generate_session_name")
             new_name = _generate_session_name(agent, text)
+            _debug_log("Generated name: $new_name")
             if !isempty(new_name) && m.current_session.name != new_name
                 m.current_session.name = new_name
                 m.current_session.updated_at = now()
