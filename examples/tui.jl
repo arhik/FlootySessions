@@ -1835,13 +1835,17 @@ function _select_model!(m::TuiModel)
 end
 
 function _generate_session_name(agent::Agent, first_message::String)::String
-    # Ask agent to suggest a name based on the query
-    naming_prompt = """Suggest a concise session name (2-4 words) for a conversation that starts with this query: \"$first_message\"
+    # Create a temporary agent for naming to avoid polluting the main conversation
+    # Use the same provider and model but empty context
+    try
+        prov = provider(agent)
+        temp_agent = create_agent("NamingAgent", prov; model=agent.model)
+        
+        naming_prompt = """Suggest a concise session name (2-4 words) for a conversation that starts with this query: \"$first_message\"
 
 Reply with ONLY the name, no quotes or explanation. Keep it under 40 characters."""
-    
-    try
-        response = chat(agent, naming_prompt; stream=false, auto_tools=false)
+        
+        response = chat(temp_agent, naming_prompt; stream=false, auto_tools=false)
         name = strip(content(response))
         
         # Clean up the name
