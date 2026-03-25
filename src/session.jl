@@ -26,7 +26,7 @@ end
 function Session(name::String; 
                  root_agent::Union{AbstractAgent,Nothing}=nothing,
                  workspace_folders::Vector{String}=String[],
-                 tools::Vector{<:AbstractTool}=AbstractTool[])
+                 tools::Vector{<:AbstractTool}=list_default_tools())
     now_time = now()
     active_id = root_agent !== nothing ? root_agent.id : nothing
     Session(
@@ -65,6 +65,12 @@ function FlootyAbstract.add_agent_to_session!(s::Session, agent::AbstractAgent)
     else
         add_child!(s.root_agent, agent)
     end
+    
+    # Pass session tools to agent if agent has no tools
+    if isempty(agent.tools) && !isempty(s.tools)
+        agent.tools = s.tools
+    end
+    
     s.updated_at = now()
     s
 end

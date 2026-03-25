@@ -4,6 +4,7 @@ using FlootyAbstract
 using FlootyAbstract: AbstractSession, AbstractAgent, AbstractTool, SessionStatus, SESSION_ACTIVE, SESSION_PAUSED, SESSION_CLOSED, AbstractPersistable, AbstractPersistenceBackend, save!, load, delete!, list
 import FlootyAbstract: get_messages, add_message!
 using FlootyAgents: Agent, descendants, add_child!, create_subagent, SimpleStack
+using FlootyBase: Tool, ToolParameter, pwd_tool, ls_tool, read_tool, write_tool, shell_tool, diffview_tool, list_default_tools
 using FlootyContextManager
 using FlootyStreams: OllamaTool, OllamaFunction
 using StructTypes
@@ -14,13 +15,12 @@ export Session, SessionManager, SessionData
 export session_id, session_name, session_status, session_agents, session_workspace
 export session_context, session_created_at, session_updated_at, session_tools
 export set_active_agent!
-export Tool, ToolParameter, pwd_tool, ls_tool, read_tool, write_tool, shell_tool, diffview_tool, list_default_tools
+export list_default_tools
 export get_messages, add_message!
 
 include("session.jl")
 include("manager.jl")
 include("persistence.jl")
-include("tools.jl")
 
 # Session - Mutable struct with abstract type fields
 StructTypes.StructType(::Type{Session}) = StructTypes.Mutable()
