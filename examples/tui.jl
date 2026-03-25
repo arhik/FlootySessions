@@ -1906,14 +1906,13 @@ function _send_message!(m::TuiModel)
                 result = chat(agent, text; stream=false, auto_tools=true)
                 
                 # Update the user message metadata with the model used
+                # The user message should be at msg_count_before + 1
                 if length(agent.context.messages) > msg_count_before
-                    # Find the last user message (should be the one just added)
-                    for i in length(agent.context.messages):-1:1
-                        ctx_msg = agent.context.messages[i]
+                    user_msg_idx = msg_count_before + 1
+                    if user_msg_idx <= length(agent.context.messages)
+                        ctx_msg = agent.context.messages[user_msg_idx]
                         if role(ctx_msg.message) == "user"
-                            # Update metadata with model
                             ctx_msg.metadata["model"] = current_model
-                            break
                         end
                     end
                 end
@@ -1948,14 +1947,15 @@ function _send_message!(m::TuiModel)
                 result = chat(agent, text, attachments; stream=false, auto_tools=true)
                 
                 # Update metadata with attachment info
+                # The user message should be at msg_count_before + 1
                 if length(agent.context.messages) > msg_count_before
-                    for i in length(agent.context.messages):-1:1
-                        ctx_msg = agent.context.messages[i]
+                    user_msg_idx = msg_count_before + 1
+                    if user_msg_idx <= length(agent.context.messages)
+                        ctx_msg = agent.context.messages[user_msg_idx]
                         if role(ctx_msg.message) == "user"
                             ctx_msg.metadata["model"] = current_model
                             ctx_msg.metadata["attachment_paths"] = paths
                             ctx_msg.metadata["attachment_mimes"] = mimes
-                            break
                         end
                     end
                 end
@@ -2046,12 +2046,13 @@ function _trigger_llm_response!(m::TuiModel, edited_text::String, attachments::V
                 result = chat(agent, edited_text; stream=false, auto_tools=true)
                 
                 # Update the user message metadata with the model used
+                # The user message should be at msg_count_before + 1
                 if length(agent.context.messages) > msg_count_before
-                    for i in length(agent.context.messages):-1:1
-                        ctx_msg = agent.context.messages[i]
+                    user_msg_idx = msg_count_before + 1
+                    if user_msg_idx <= length(agent.context.messages)
+                        ctx_msg = agent.context.messages[user_msg_idx]
                         if role(ctx_msg.message) == "user"
                             ctx_msg.metadata["model"] = current_model
-                            break
                         end
                     end
                 end
@@ -2079,14 +2080,15 @@ function _trigger_llm_response!(m::TuiModel, edited_text::String, attachments::V
                 result = chat(agent, edited_text, att_objs; stream=false, auto_tools=true)
                 
                 # Update metadata with model and attachment info
+                # The user message should be at msg_count_before + 1
                 if length(agent.context.messages) > msg_count_before
-                    for i in length(agent.context.messages):-1:1
-                        ctx_msg = agent.context.messages[i]
+                    user_msg_idx = msg_count_before + 1
+                    if user_msg_idx <= length(agent.context.messages)
+                        ctx_msg = agent.context.messages[user_msg_idx]
                         if role(ctx_msg.message) == "user"
                             ctx_msg.metadata["model"] = current_model
                             ctx_msg.metadata["attachment_paths"] = paths
                             ctx_msg.metadata["attachment_mimes"] = mimes
-                            break
                         end
                     end
                 end
