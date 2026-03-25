@@ -17,7 +17,7 @@ mutable struct Session <: AbstractSession
     # Full positional constructor
     Session(id::UUID, name::String, status::SessionStatus, 
             root_agent::Union{AbstractAgent,Nothing}, active_agent_id::Union{UUID,Nothing}, 
-            workspace_folders::Vector{String}, tools::Vector{AbstractTool}, 
+            workspace_folders::Vector{String}, tools::Vector{<:AbstractTool}, 
             metadata::Dict{String,Any}, created_at::DateTime, updated_at::DateTime) = 
         new(id, name, status, root_agent, active_agent_id, workspace_folders, tools, metadata, created_at, updated_at)
 end
