@@ -2,30 +2,36 @@
 # FlootySessions TUI - Session-based Chat Interface with Persistence
 #
 # Keys:
-#   Ctrl+C or Esc    - Quit (auto-saves sessions)
+#   Ctrl+C           - Quit (auto-saves sessions)
 #   F2               - Toggle session sidebar
 #   F3               - New session modal
 #   F4               - Delete current session (with confirmation)
 #   F5               - Force save all sessions
 #   F6               - Select model for current session
-#   F7               - Toggle message select mode (copy/delete messages)
+#   F7               - Toggle message select mode (copy/delete/edit)
+#   F8               - Show system prompt (diff-first development rules)
+#   Esc              - Cancel/close current mode OR interrupt streaming
 #   Tab              - Switch focus (sidebar/chat/input)
 #   Enter            - Send message (when in input)
 #   Up/Down          - Navigate sessions or scroll chat
+#   @                - Add image attachment (URL or file path)
 # ═══════════════════════════════════════════════════════════════════════
 
 using Tachikoma
 using FlootySessions
-using FlootySessions: Session, SessionManager, set_active_agent!, SessionData
+using FlootySessions: Session, SessionManager, set_active_agent!, set_active_session!, create_session!, close_session!, get_active_session, SessionData, list_sessions, session_agents, SESSION_ACTIVE, SESSION_PAUSED, get_active_agent
 using FlootyAgents
 using FlootyAgents: Agent, create_agent, descendants
-using FlootyAbstract
+using FlootyAbstract: AbstractMessage, AbstractProviderObject, AbstractAttachment, AbstractFlootyError, create_message, create_attachments, content, role, images, attachment_path, attachment_type, attachment_mime, provider, provider_name, list_provider_models, chat, chat_stream, call_name, call_arguments, execute_tool
+using DiffUtils
 using FlootyContextManager: add_message!, get_messages, get_full_history, ContextMessage
 using FlootyPersistence
+# Image data is created through FlootyAbstract.create_image_data(provider, data)
 using UUIDs
 using Dates
 using JSON3
 using InteractiveUtils
+using HTTP
 
 @tachikoma_app
 
@@ -74,6 +80,39 @@ const ACTIVE_SESSION = Style(fg=ColorRGB(255, 255, 100), bold=true)
 const INACTIVE_SESSION = Style(fg=Color256(245))
 const SAVED_STATUS = Style(fg=ColorRGB(100, 255, 100))
 const UNSAVED_STATUS = Style(fg=ColorRGB(255, 100, 100))
+
+# ═══════════════════════════════════════════════════════════════════════
+# Attachments Support
+# ═══════════════════════════════════════════════════════════════════════
+# Simple attachment struct - just stores path and type
+# The actual attachment object (ImageAttachment, etc.) is created by the provider
+struct Attachment
+    path::String
+    is_url::Bool
+    mime_type::String  # "image/png", "image/jpeg", "application/pdf", etc.
+end
+
+# Guess MIME type from file extension
+function _guess_mime_type(path::String)::String
+    ext = lowercase(splitext(path)[2])
+    mime_map = Dict(
+        ".png" => "image/png",
+        ".jpg" => "image/jpeg",
+        ".jpeg" => "image/jpeg",
+        ".gif" => "image/gif",
+        ".bmp" => "image/bmp",
+        ".webp" => "image/webp",
+        ".pdf" => "application/pdf",
+        ".txt" => "text/plain",
+        ".md" => "text/markdown",
+        ".json" => "application/json",
+        ".wav" => "audio/wav",
+        ".mp3" => "audio/mpeg",
+        ".mp4" => "video/mp4",
+        ".mov" => "video/quicktime"
+    )
+    get(mime_map, ext, "application/octet-stream")
+end
 
 # ═══════════════════════════════════════════════════════════════════════
 # Message Widget
@@ -165,6 +204,13 @@ function render_widget(buf::Buffer, widget::MessageWidget, x::Int, y::Int, max_y
     
     # Build metadata footer (dim style)
     metadata_parts = String[]
+    
+    # Add attachment indicator if message has images
+    msg_images = images(msg)
+    if msg_images !== nothing && !isempty(msg_images)
+        img_count = length(msg_images)
+        push!(metadata_parts, img_count == 1 ? "📎 1 image" : "📎 $img_count images")
+    end
     
     # Add timestamp if available
     if widget.timestamp !== nothing
@@ -515,14 +561,55 @@ end
 # ═══════════════════════════════════════════════════════════════════════
 function save_all_sessions(manager::SessionManager, filepath::String)
     mkpath(dirname(filepath))
-    # Use StructTypes to serialize sessions directly
+    # Create a copy of sessions with image data stripped (paths are in metadata)
+    sessions_data = []
+    for session in values(manager.sessions)
+        # Strip images from messages before saving (paths are preserved in metadata)
+        s = _strip_images_from_session(session)
+        push!(sessions_data, JSON3.write(s))
+    end
     data = Dict(
-        "sessions" => [JSON3.write(s) for s in values(manager.sessions)],
+        "sessions" => sessions_data,
         "active_session_id" => manager.active_session_id === nothing ? nothing : string(manager.active_session_id)
     )
     open(filepath, "w") do f
         JSON3.write(f, data)
     end
+end
+
+"""
+    _strip_images_from_session(session::Session)
+
+Create a copy of the session with image data stripped from messages.
+Attachment paths are preserved in metadata for later restoration.
+"""
+function _strip_images_from_session(session::Session)
+    # Deep copy the session
+    s = deepcopy(session)
+    if s.root_agent !== nothing
+        # Replace messages with stripped versions (ContextMessage is immutable)
+        new_messages = ContextMessage[]
+        for ctx_msg in s.root_agent.context.messages
+            msg = ctx_msg.message
+            # If message has images, create new message without images
+            if images(msg) !== nothing && !isempty(images(msg))
+                prov = provider(s.root_agent)
+                # Create new message without images (paths are in metadata)
+                new_msg = create_message(prov, role(msg), content(msg))
+                # Create new ContextMessage with stripped message
+                new_ctx_msg = ContextMessage(
+                    new_msg;
+                    embedding=ctx_msg.embedding,
+                    metadata=ctx_msg.metadata
+                )
+                push!(new_messages, new_ctx_msg)
+            else
+                push!(new_messages, ctx_msg)
+            end
+        end
+        s.root_agent.context.messages = new_messages
+    end
+    return s
 end
 
 function load_all_sessions!(manager::SessionManager, filepath::String)
@@ -544,13 +631,88 @@ function load_all_sessions!(manager::SessionManager, filepath::String)
         manager.active_session_id = UUID(data["active_session_id"])
     end
     
+    # Restore images from attachment paths in metadata
+    _restore_images_from_paths!(manager)
+    
+    # Clean up empty assistant messages from old sessions
+    _cleanup_empty_messages!(manager)
+    
     true
+end
+
+"""
+    _restore_images_from_paths!(manager::SessionManager)
+
+After loading sessions, restore attachments from paths stored in metadata.
+This avoids saving base64 data in JSON files.
+"""
+function _restore_images_from_paths!(manager::SessionManager)
+    for session in values(manager.sessions)
+        if session.root_agent !== nothing
+            # Replace messages with restored versions (ContextMessage is immutable)
+            new_messages = ContextMessage[]
+            for ctx_msg in session.root_agent.context.messages
+                msg = ctx_msg.message
+                # Check if message has attachment_paths in metadata but no images
+                if haskey(ctx_msg.metadata, "attachment_paths") && images(msg) === nothing
+                    paths = ctx_msg.metadata["attachment_paths"]
+                    mimes = get(ctx_msg.metadata, "attachment_mimes", fill("application/octet-stream", length(paths)))
+                    prov = provider(session.root_agent)
+                    
+                    # Create attachments using provider
+                    attachments = create_attachments(prov, paths, mimes)
+                    
+                    # Create new message with attachments
+                    if !isempty(attachments)
+                        new_msg = create_message(prov, role(msg), content(msg), attachments)
+                        # Create new ContextMessage with restored message
+                        new_ctx_msg = ContextMessage(
+                            new_msg;
+                            embedding=ctx_msg.embedding,
+                            metadata=ctx_msg.metadata
+                        )
+                        push!(new_messages, new_ctx_msg)
+                    else
+                        push!(new_messages, ctx_msg)
+                    end
+                else
+                    push!(new_messages, ctx_msg)
+                end
+            end
+            session.root_agent.context.messages = new_messages
+        end
+    end
+end
+
+"""
+    _cleanup_empty_messages!(manager::SessionManager)
+
+Remove empty assistant messages from all sessions.
+This fixes sessions that had empty messages added before the FlootyAgents fix.
+"""
+function _cleanup_empty_messages!(manager::SessionManager)
+    for session in values(manager.sessions)
+        if session.root_agent !== nothing
+            original_count = length(session.root_agent.context.messages)
+            filter!(ctx_msg -> begin
+                msg = ctx_msg.message
+                msg_role = role(msg)
+                msg_content = content(msg)
+                # Keep message unless it's an empty assistant message
+                !(msg_role == "assistant" && (msg_content === nothing || isempty(msg_content)))
+            end, session.root_agent.context.messages)
+            removed_count = original_count - length(session.root_agent.context.messages)
+            if removed_count > 0
+                @info "Cleaned up $removed_count empty assistant messages from session $(session.name)"
+            end
+        end
+    end
 end
 
 # ═══════════════════════════════════════════════════════════════════════
 # Modal States
 # ═══════════════════════════════════════════════════════════════════════
-@enum ModalState MODAL_NONE MODAL_DELETE_CONFIRM MODAL_SESSION_SWITCHER MODAL_MODEL_SELECT
+@enum ModalState MODAL_NONE MODAL_DELETE_CONFIRM MODAL_SESSION_SWITCHER MODAL_MODEL_SELECT MODAL_DIFF_VIEW MODAL_SYSTEM_PROMPT
 
 # ═══════════════════════════════════════════════════════════════════════
 # TUI Model
@@ -578,6 +740,7 @@ end
     edit_mode::Bool = false  # When true, editing selected message
     edit_area::TextArea = TextArea(text="", focused=true, tick=0)  # TextArea for editing
     editing_message_idx::Union{Int,Nothing} = nothing  # Index of message being edited
+    edit_attachments::Vector{Attachment} = Attachment[]  # Attachments being edited
     
     # Layout cache for mouse handling (updated in view, used in mouse handler)
     layout_sidebar_width::Int = 0
@@ -608,6 +771,12 @@ end
     modal_selected::Symbol = :cancel
     modal_message::String = ""
     
+    # Diff view state for file editing
+    diff_view_old::String = ""      # Original file content
+    diff_view_new::String = ""      # New file content
+    diff_view_path::String = ""     # File path being edited
+    diff_view_tool_call::Any = nothing  # Tool call to execute if confirmed
+    
     # Model selection
     available_models::Vector{String} = [
         "nemotron-3-nano:30b-cloud",
@@ -622,6 +791,11 @@ end
     persistence_backend::JSONBackend = JSONBackend(PERSISTENCE_DIR)
     last_save::DateTime = now()
     auto_save_interval::Int = 30  # seconds
+    
+    # Attachments
+    attachments::Vector{Attachment} = Attachment[]
+    attachment_mode::Bool = false
+    attachment_input::TextInput = TextInput(text="", focused=true, tick=0)
 end
 
 should_quit(m::TuiModel) = m.quit
@@ -688,7 +862,7 @@ function _switch_to_session!(m::TuiModel, idx::Int)
         # Create a new agent if none exists
         agent = create_agent("Assistant", :ollama)
         session.root_agent = agent
-        session.active_agent = agent
+        session.active_agent_id = agent.id
     end
     
     set_active_session!(m.manager, session.id)
@@ -743,7 +917,44 @@ function update!(m::TuiModel, evt::Event)
     end
 end
 
+function _handle_attachment_key!(m::TuiModel, evt::KeyEvent)
+    if evt.key == :escape
+        m.attachment_mode = false
+        _set_status!(m, "Attachment cancelled")
+        return
+    end
+    
+    if evt.key == :enter || (evt.key == :char && evt.char == '\n')
+        path = String(strip(String(m.attachment_input.buffer)))
+        if !isempty(path)
+            is_url = startswith(path, "http://") || startswith(path, "https://")
+            mime = _guess_mime_type(path)
+            
+            # Add to appropriate attachment list based on mode
+            if m.edit_mode
+                push!(m.edit_attachments, Attachment(path, is_url, mime))
+                _set_status!(m, "📎 Attached: $(basename(path)) ($(length(m.edit_attachments)) total)")
+            else
+                push!(m.attachments, Attachment(path, is_url, mime))
+                _set_status!(m, "📎 Attached: $(basename(path)) ($(length(m.attachments)) total)")
+            end
+        else
+            _set_status!(m, "No path entered")
+        end
+        m.attachment_mode = false
+        return
+    end
+    
+    handle_key!(m.attachment_input, evt)
+end
+
 function _handle_key!(m::TuiModel, evt::KeyEvent)
+    # Attachment mode takes precedence
+    if m.attachment_mode
+        _handle_attachment_key!(m, evt)
+        return
+    end
+    
     # Modal handling takes precedence
     if m.modal != MODAL_NONE
         _handle_modal_key!(m, evt)
@@ -751,9 +962,17 @@ function _handle_key!(m::TuiModel, evt::KeyEvent)
     end
     
     # Global shortcuts
-    if (evt.key == :char && evt.char == '\x03') || evt.key == :escape
+    # Ctrl+C to quit (only way to exit)
+    if evt.key == :char && evt.char == '\x03'
         _auto_save!(m)  # Save before quit
         m.quit = true
+        return
+    end
+    
+    # Esc interrupts streaming when active, otherwise handled by specific modes
+    if evt.key == :escape && m.streaming_session_id !== nothing
+        m.streaming_session_id = nothing
+        _set_status!(m, "⏹ Streaming interrupted")
         return
     end
     
@@ -779,6 +998,12 @@ function _handle_key!(m::TuiModel, evt::KeyEvent)
     
     if evt.key == :f6
         _open_model_select_modal!(m)
+        return
+    end
+    
+    if evt.key == :f8
+        # Show system prompt in a temporary view
+        _show_system_prompt_modal!(m)
         return
     end
     
@@ -856,7 +1081,7 @@ function _handle_key!(m::TuiModel, evt::KeyEvent)
     
     # Edit mode handling
     if m.edit_mode && m.editing_message_idx !== nothing
-        # Check for save key first (F2 to save)
+        # Check for save key first (F9 to save)
         if evt.key == :f9
             _save_edited_message!(m)
             return
@@ -864,7 +1089,23 @@ function _handle_key!(m::TuiModel, evt::KeyEvent)
             # Cancel edit
             m.edit_mode = false
             m.editing_message_idx = nothing
+            empty!(m.edit_attachments)
             m.message_select_mode = true  # Return to select mode
+            return
+        elseif evt.key == :delete || evt.key == :char && evt.char == 'd'
+            # Delete last attachment
+            if !isempty(m.edit_attachments)
+                removed = pop!(m.edit_attachments)
+                _set_status!(m, "Removed attachment: $(basename(removed.path)) ($(length(m.edit_attachments)) remaining)")
+            else
+                _set_status!(m, "No attachments to remove")
+            end
+            return
+        elseif evt.key == :char && evt.char == 'a'
+            # Add new attachment in edit mode
+            m.attachment_mode = true
+            empty!(m.attachment_input.buffer)
+            m.attachment_input.cursor = 0
             return
         end
         
@@ -949,9 +1190,30 @@ function _handle_key!(m::TuiModel, evt::KeyEvent)
     
     # Input handling
     if !m.sidebar_focused
+        # Check for attachment mode trigger (@ key)
+        if evt.key == :char && evt.char == '@'
+            m.attachment_mode = true
+            empty!(m.attachment_input.buffer)
+            m.attachment_input.cursor = 0
+            return
+        end
+        
         handled = handle_key!(m.input, evt)
         text = String(strip(String(m.input.buffer)))
-        if !handled && !isempty(text)
+        
+        # Auto-detect file drops/pastes - if text looks like a file path, convert to attachment
+        if !handled && isfile(text)
+            mime = _guess_mime_type(text)
+            # It's a file path - add as attachment and clear input
+            push!(m.attachments, Attachment(text, false, mime))
+            empty!(m.input.buffer)
+            m.input.cursor = 0
+            _set_status!(m, "Added attachment: $(basename(text))")
+            return
+        end
+        
+        can_send = !isempty(text) || !isempty(m.attachments)
+        if !handled && can_send
             is_this_session_streaming = m.current_session !== nothing && m.streaming_session_id == m.current_session.id
             
             if evt.key == :enter || (evt.key == :char && evt.char == '\n')
@@ -1007,6 +1269,20 @@ function _handle_modal_key!(m::TuiModel, evt::KeyEvent)
             _select_model!(m)
             m.modal = MODAL_NONE
         elseif evt.key == :escape
+            m.modal = MODAL_NONE
+        end
+    elseif m.modal == MODAL_DIFF_VIEW
+        if evt.key == :char && evt.char == 'y'
+            # Confirm - execute the tool call
+            _execute_diff_tool_call!(m)
+            m.modal = MODAL_NONE
+        elseif evt.key == :char && evt.char == 'n' || evt.key == :escape
+            # Cancel
+            _set_status!(m, "File edit cancelled")
+            m.modal = MODAL_NONE
+        end
+    elseif m.modal == MODAL_SYSTEM_PROMPT
+        if evt.key == :escape || evt.key == :char && evt.char == 'q'
             m.modal = MODAL_NONE
         end
     end
@@ -1296,7 +1572,7 @@ function _copy_selected_message!(m::TuiModel)
     m.selected_message_idx > length(context_messages) && return
     
     ctx_msg = context_messages[m.selected_message_idx]
-    msg_content = FlootyAbstract.content(ctx_msg.message)
+    msg_content = content(ctx_msg.message)
     msg_content === nothing && return
     
     # Copy to clipboard using InteractiveUtils
@@ -1326,7 +1602,7 @@ function _delete_selected_message!(m::TuiModel)
     # Get the ContextMessage to delete (this contains the actual message in the store)
     ctx_msg = context_messages[m.selected_message_idx]
     msg = ctx_msg.message
-    msg_role = FlootyAbstract.role(msg)
+    msg_role = role(msg)
     
     _debug_log("Message role: $msg_role, message type: $(typeof(msg))")
     
@@ -1375,11 +1651,11 @@ function _start_edit_message!(m::TuiModel)
     # Get the message to edit
     ctx_msg = context_messages[m.selected_message_idx]
     msg = ctx_msg.message
-    msg_content = FlootyAbstract.content(msg)
+    msg_content = content(msg)
     msg_content === nothing && return
     
     # Only allow editing user messages (not assistant/tool responses)
-    msg_role = FlootyAbstract.role(msg)
+    msg_role = role(msg)
     if msg_role != "user"
         _set_status!(m, "Can only edit user messages")
         return
@@ -1400,7 +1676,28 @@ function _start_edit_message!(m::TuiModel)
     m.edit_area.cursor_row = length(m.edit_area.lines)
     m.edit_area.cursor_col = length(m.edit_area.lines[end])
     
-    _set_status!(m, "In-place editing (F9:save Esc:cancel)")
+    # Load attachments from message metadata
+    empty!(m.edit_attachments)
+    if haskey(ctx_msg.metadata, "attachment_paths")
+        paths = ctx_msg.metadata["attachment_paths"]
+        mimes = get(ctx_msg.metadata, "attachment_mimes", fill("application/octet-stream", length(paths)))
+        for (path, mime) in zip(paths, mimes)
+            # Check if file still exists
+            is_url = startswith(path, "http://") || startswith(path, "https://")
+            if is_url || isfile(path)
+                push!(m.edit_attachments, Attachment(path, is_url, mime))
+            else
+                @warn "Attachment file not found, skipping: $path"
+            end
+        end
+    end
+    
+    att_count = length(m.edit_attachments)
+    if att_count > 0
+        _set_status!(m, "Editing message with $att_count attachment(s) (F9:save Esc:cancel Del:remove att)")
+    else
+        _set_status!(m, "In-place editing (F9:save Esc:cancel)")
+    end
 end
 
 function _save_edited_message!(m::TuiModel)
@@ -1435,7 +1732,7 @@ function _save_edited_message!(m::TuiModel)
     # Find the message in the store
     idx = findfirst(cm -> cm.id == ctx_msg.id, store.messages)
     if idx !== nothing
-        prov = FlootyAbstract.provider(agent)
+        prov = provider(agent)
         
         # Truncate history: keep messages BEFORE the edited one (1 to idx-1)
         # Remove the old edited message and everything after it
@@ -1445,6 +1742,9 @@ function _save_edited_message!(m::TuiModel)
         # DON'T add the message here - let chat() add it
         # This prevents duplicate messages
         
+        # Save attachments before clearing edit mode
+        edit_atts = copy(m.edit_attachments)
+        
         _set_status!(m, "Message updated, history truncated ($num_removed messages removed), sending to LLM...")
         _auto_save!(m)
         
@@ -1453,11 +1753,12 @@ function _save_edited_message!(m::TuiModel)
         m.editing_message_idx = nothing
         empty!(m.edit_area.lines)
         m.edit_area.cursor_row = 1; m.edit_area.cursor_col = 0
+        empty!(m.edit_attachments)  # Clear edit attachments
         m.message_select_mode = false  # Exit select mode
         m.selected_message_idx = nothing
         
-        # Trigger LLM to respond - chat() will add the edited message
-        _trigger_llm_response!(m, new_text)
+        # Trigger LLM to respond with attachments
+        _trigger_llm_response!(m, new_text, edit_atts)
         
         return  # Early return
     else
@@ -1481,10 +1782,10 @@ function _open_model_select_modal!(m::TuiModel)
     agent = m.current_session.root_agent
     if agent !== nothing
         try
-            prov = FlootyAbstract.provider(agent)
-            provider_id = FlootyAbstract.provider_name(prov)
+            prov = provider(agent)
+            provider_id = provider_name(prov)
             config = Dict{Symbol, Any}(:baseURL => prov.baseURL)
-            models = FlootyAbstract.list_provider_models(provider_id, config)
+            models = list_provider_models(provider_id, config)
             if !isempty(models)
                 # Extract model names from ModelInfo objects
                 model_names = [model.name for model in models]
@@ -1538,8 +1839,8 @@ function _generate_session_name(agent::Agent, first_message::String)::String
 Reply with ONLY the name, no quotes or explanation. Keep it under 40 characters."""
     
     try
-        response = FlootyAbstract.chat(agent, naming_prompt; stream=false, auto_tools=false)
-        name = strip(FlootyAbstract.content(response))
+        response = chat(agent, naming_prompt; stream=false, auto_tools=false)
+        name = strip(content(response))
         
         # Clean up the name
         name = replace(name, r"^[[\\\"']+" => "")  # Remove leading quotes
@@ -1564,28 +1865,103 @@ function _send_message!(m::TuiModel)
     m.current_session.root_agent === nothing && return
     
     text = String(strip(String(m.input.buffer)))
-    isempty(text) && return
+    isempty(text) && isempty(m.attachments) && return
     
     # Get the agent to use
     agent = FlootySessions.get_active_agent(m.current_session)
     agent === nothing && return
     
+    # Capture the current model at send time - this is the model used for this message
+    current_model = agent.model
+    
     is_first_message = isempty(get_messages(agent.context))
+    
+    # Save attachment info before clearing
+    attachment_info = [(path=att.path, is_url=att.is_url, mime=att.mime_type) for att in m.attachments]
+    has_attachments = !isempty(attachment_info)
     
     empty!(m.input.buffer)
     m.input.cursor = 0
+    empty!(m.attachments)
     current_session_id = m.current_session.id
     m.streaming_session_id = current_session_id
     m.last_message_count = 0  # Reset to trigger auto-scroll when response arrives
     m.last_content_hash = 0   # Reset content hash tracking
     
+    # Handle text-only vs attachment messages differently
+    # Text-only: use normal chat flow
+    # With attachments: manually add message then trigger LLM response
     result_channel = Channel{Any}(1)
-    @async begin
-        try
-            result = FlootyAbstract.chat(agent, text; stream=false, auto_tools=true)
-            put!(result_channel, result)
-        catch e
-            put!(result_channel, e)
+    
+    if !has_attachments
+        # Normal text message - let chat() handle adding the message
+        # After chat completes, we'll update the last message's metadata with the model
+        @async begin
+            try
+                # Get message count before chat
+                msg_count_before = length(get_messages(agent.context))
+                
+                result = chat(agent, text; stream=false, auto_tools=true)
+                
+                # Update the user message metadata with the model used
+                if length(agent.context.messages) > msg_count_before
+                    # Find the last user message (should be the one just added)
+                    for i in length(agent.context.messages):-1:1
+                        ctx_msg = agent.context.messages[i]
+                        if role(ctx_msg.message) == "user"
+                            # Update metadata with model
+                            ctx_msg.metadata["model"] = current_model
+                            break
+                        end
+                    end
+                end
+                
+                put!(result_channel, result)
+            catch e
+                put!(result_channel, e)
+            end
+        end
+    else
+        # Message with attachments - let agent handle everything
+        prov = provider(agent)
+        
+        # Create attachments using provider
+        paths = [info.path for info in attachment_info]
+        mimes = [info.mime for info in attachment_info]
+        attachments = create_attachments(prov, paths, mimes)
+        
+        # Store attachment info in metadata for persistence
+        msg_metadata = Dict{String, Any}(
+            "model" => current_model,
+            "attachment_paths" => paths,
+            "attachment_mimes" => mimes
+        )
+        
+        # Use new chat function with attachments - it handles message creation
+        @async begin
+            try
+                # Get message count before chat
+                msg_count_before = length(get_messages(agent.context))
+                
+                result = chat(agent, text, attachments; stream=false, auto_tools=true)
+                
+                # Update metadata with attachment info
+                if length(agent.context.messages) > msg_count_before
+                    for i in length(agent.context.messages):-1:1
+                        ctx_msg = agent.context.messages[i]
+                        if role(ctx_msg.message) == "user"
+                            ctx_msg.metadata["model"] = current_model
+                            ctx_msg.metadata["attachment_paths"] = paths
+                            ctx_msg.metadata["attachment_mimes"] = mimes
+                            break
+                        end
+                    end
+                end
+                
+                put!(result_channel, result)
+            catch e
+                put!(result_channel, e)
+            end
         end
     end
     
@@ -1596,11 +1972,11 @@ function _send_message!(m::TuiModel)
             m.streaming_session_id = nothing
         end
         if result isa Exception
-            prov = FlootyAbstract.provider(agent)
+            prov = provider(agent)
             add_message!(agent.context, 
                 create_message(prov, "system", "⚠️ Error: $(sprint(showerror, result))"))
-        elseif result isa FlootyAbstract.AbstractFlootyError
-            prov = FlootyAbstract.provider(agent)
+        elseif result isa AbstractFlootyError
+            prov = provider(agent)
             add_message!(agent.context, 
                 create_message(prov, "system", "⚠️ Chat error: $(result.message)"))
         end
@@ -1634,17 +2010,21 @@ function _send_message!(m::TuiModel)
 end
 
 """
-    _trigger_llm_response!(m::TuiModel, edited_text::String)
+    _trigger_llm_response!(m::TuiModel, edited_text::String, attachments::Vector{Attachment}=Attachment[])
 
 Trigger the LLM to generate a response to the edited message.
 The edited message is sent to the LLM with the truncated history.
+Supports attachments for edited messages.
 """
-function _trigger_llm_response!(m::TuiModel, edited_text::String)
+function _trigger_llm_response!(m::TuiModel, edited_text::String, attachments::Vector{Attachment}=Attachment[])
     m.current_session === nothing && return
     m.current_session.root_agent === nothing && return
     
     agent = FlootySessions.get_active_agent(m.current_session)
     agent === nothing && return
+    
+    # Capture the current model at send time
+    current_model = agent.model
     
     current_session_id = m.current_session.id
     m.streaming_session_id = current_session_id
@@ -1652,14 +2032,67 @@ function _trigger_llm_response!(m::TuiModel, edited_text::String)
     m.last_content_hash = 0
     
     result_channel = Channel{Any}(1)
-    @async begin
-        try
-            # Send the edited message text to get LLM response
-            # The agent's context already has the history up to before the edit
-            result = FlootyAbstract.chat(agent, edited_text; stream=false, auto_tools=true)
-            put!(result_channel, result)
-        catch e
-            put!(result_channel, e)
+    
+    if isempty(attachments)
+        # No attachments - use normal chat flow
+        @async begin
+            try
+                # Get message count before chat
+                msg_count_before = length(get_messages(agent.context))
+                
+                # Send the edited message text to get LLM response
+                result = chat(agent, edited_text; stream=false, auto_tools=true)
+                
+                # Update the user message metadata with the model used
+                if length(agent.context.messages) > msg_count_before
+                    for i in length(agent.context.messages):-1:1
+                        ctx_msg = agent.context.messages[i]
+                        if role(ctx_msg.message) == "user"
+                            ctx_msg.metadata["model"] = current_model
+                            break
+                        end
+                    end
+                end
+                
+                put!(result_channel, result)
+            catch e
+                put!(result_channel, e)
+            end
+        end
+    else
+        # With attachments - use chat with attachments
+        @async begin
+            try
+                prov = provider(agent)
+                
+                # Create attachments using provider
+                paths = [att.path for att in attachments]
+                mimes = [att.mime_type for att in attachments]
+                att_objs = create_attachments(prov, paths, mimes)
+                
+                # Get message count before chat
+                msg_count_before = length(get_messages(agent.context))
+                
+                # Send with attachments
+                result = chat(agent, edited_text, att_objs; stream=false, auto_tools=true)
+                
+                # Update metadata with model and attachment info
+                if length(agent.context.messages) > msg_count_before
+                    for i in length(agent.context.messages):-1:1
+                        ctx_msg = agent.context.messages[i]
+                        if role(ctx_msg.message) == "user"
+                            ctx_msg.metadata["model"] = current_model
+                            ctx_msg.metadata["attachment_paths"] = paths
+                            ctx_msg.metadata["attachment_mimes"] = mimes
+                            break
+                        end
+                    end
+                end
+                
+                put!(result_channel, result)
+            catch e
+                put!(result_channel, e)
+            end
         end
     end
     
@@ -1669,11 +2102,11 @@ function _trigger_llm_response!(m::TuiModel, edited_text::String)
             m.streaming_session_id = nothing
         end
         if result isa Exception
-            prov = FlootyAbstract.provider(agent)
+            prov = provider(agent)
             add_message!(agent.context, 
                 create_message(prov, "system", "⚠️ Error: $(sprint(showerror, result))"))
-        elseif result isa FlootyAbstract.AbstractFlootyError
-            prov = FlootyAbstract.provider(agent)
+        elseif result isa AbstractFlootyError
+            prov = provider(agent)
             add_message!(agent.context, 
                 create_message(prov, "system", "⚠️ Chat error: $(result.message)"))
         end
@@ -1779,7 +2212,15 @@ function _build_status(m::TuiModel)::String
     
     # Edit mode indicator
     if m.edit_mode
-        push!(parts, "[EDIT MODE] Enter:save Esc:cancel")
+        if isempty(m.edit_attachments)
+            push!(parts, "[EDIT MODE] F9:save Esc:cancel a:add-att d:del-att")
+        else
+            att_count = length(m.edit_attachments)
+            push!(parts, "[EDIT MODE] F9:save Esc:cancel a:add-att d:del-att 📎$att_count")
+        end
+    # Attachment mode indicator
+    elseif m.attachment_mode
+        push!(parts, "[ATTACH MODE] Enter:confirm Esc:cancel")
     # Queue select mode indicator
     elseif m.queue_select_mode
         push!(parts, "[QUEUE MODE] Up/Down:nav c:copy d:delete Esc:exit")
@@ -1803,9 +2244,9 @@ function _build_status(m::TuiModel)::String
             push!(parts, "○ unsaved")
         end
         
-        m.streaming_session_id !== nothing && push!(parts, "⏳ streaming")
+        m.streaming_session_id !== nothing && push!(parts, "⏳ streaming (Esc:stop)")
         
-        push!(parts, "F2:sidebar F3:new F4:delete F5:save F6:model F7:msg q:queue End:bottom Ctrl+C:quit")
+        push!(parts, "F2:sidebar F3:new F4:del F5:save F6:model F7:msg F8:rules q:queue @:attach Ctrl+C:quit")
     end
     
     join(parts, " | ")
@@ -1950,13 +2391,15 @@ function _render_chat!(m::TuiModel, buf::Buffer, area::Rect)
     total_height = 0
     content_hash = zero(UInt)
     for ctx_msg in context_messages
+        # Get model from message metadata (if stored), otherwise use current agent model
+        msg_model = get(ctx_msg.metadata, "model", agent.model)
         widget = MessageWidget(ctx_msg.message, agent.name, content_width;
                               timestamp=ctx_msg.timestamp,
-                              model=agent.model,
+                              model=msg_model,
                               msg_agent_name=agent.name)
         total_height += _calculate_widget_height(widget) + 1  # +1 for spacing
         # Hash the message content to detect changes
-        msg_content = FlootyAbstract.content(ctx_msg.message)
+        msg_content = content(ctx_msg.message)
         if msg_content !== nothing
             content_hash = hash(msg_content, content_hash)
         end
@@ -1983,9 +2426,19 @@ function _render_chat!(m::TuiModel, buf::Buffer, area::Rect)
         is_selected = m.message_select_mode && m.selected_message_idx == idx
         is_editing = m.edit_mode && m.editing_message_idx == idx
         
+        # # Skip empty assistant messages (can happen after tool calls)
+        # msg_role = role(ctx_msg.message)
+        # msg_content = content(ctx_msg.message)
+        # if msg_role == "assistant" && (msg_content === nothing || isempty(msg_content))
+        #     continue
+        # end
+        
+        # Get model from message metadata (if stored), otherwise use current agent model
+        msg_model = get(ctx_msg.metadata, "model", agent.model)
+        
         widget = MessageWidget(ctx_msg.message, agent.name, content_width;
                               timestamp=ctx_msg.timestamp,
-                              model=agent.model,
+                              model=msg_model,
                               msg_agent_name=agent.name,
                               is_selected=is_selected,
                               is_editing=is_editing)
@@ -2131,6 +2584,37 @@ function _render_input!(m::TuiModel, buf::Buffer, area::Rect)
         return
     end
     
+    # Calculate attachment display
+    attachment_lines = isempty(m.attachments) ? 0 : 1
+    
+    # Show attachments if any (always show, even in attachment mode)
+    if !isempty(m.attachments)
+        att_style = Style(fg=ColorRGB(100, 200, 255), bg=ColorRGB(60, 60, 60))
+        att_text = "📎 " * join([basename(att.path) for att in m.attachments], ", ")
+        set_string!(buf, content_x + padding_left, area.y + padding_top, att_text, att_style; max_x=content_x + content_width - padding_right)
+    end
+    
+    # Attachment mode - show input for entering image path/URL
+    if m.attachment_mode
+        prompt = "@ "
+        prompt_style = Style(fg=ColorRGB(255, 200, 100), bg=ColorRGB(60, 60, 60))
+        set_string!(buf, content_x + padding_left, area.y + padding_top + attachment_lines, prompt, prompt_style)
+        
+        m.attachment_input.focused = true
+        m.attachment_input.tick = m.tick
+        m.attachment_input.style = input_style
+        m.attachment_input.cursor_style = cursor_style
+        
+        inner_area = Rect(
+            content_x + padding_left + 2, 
+            area.y + padding_top + attachment_lines, 
+            content_width - padding_left - padding_right - 2, 
+            area.height - padding_top - padding_bottom - attachment_lines
+        )
+        render(m.attachment_input, inner_area, buf)
+        return
+    end
+    
     # Set input style to match background (no background reset)
     m.input.style = input_style
     m.input.cursor_style = cursor_style
@@ -2138,12 +2622,12 @@ function _render_input!(m::TuiModel, buf::Buffer, area::Rect)
     m.input.focused = !m.sidebar_focused && m.modal == MODAL_NONE
     m.input.tick = m.tick
     
-    # Render input with internal padding
+    # Render input with internal padding (below attachments if any)
     inner_area = Rect(
         content_x + padding_left, 
-        area.y + padding_top, 
+        area.y + padding_top + attachment_lines, 
         content_width - padding_left - padding_right, 
-        area.height - padding_top - padding_bottom
+        area.height - padding_top - padding_bottom - attachment_lines
     )
     render(m.input, inner_area, buf)
 end
@@ -2183,18 +2667,28 @@ function _render_edit_input!(m::TuiModel, buf::Buffer, area::Rect)
     label_style = Style(fg=ColorRGB(255, 200, 100), bold=true)
     set_string!(buf, content_x + 2, area.y, label, label_style)
     
+    # Calculate attachment display
+    attachment_lines = isempty(m.edit_attachments) ? 0 : 1
+    
+    # Show attachments if any
+    if !isempty(m.edit_attachments)
+        att_style = Style(fg=ColorRGB(100, 200, 255), bg=ColorRGB(70, 70, 70))
+        att_text = "📎 " * join([basename(att.path) for att in m.edit_attachments], ", ")
+        set_string!(buf, content_x + padding_left, area.y + padding_top, att_text, att_style; max_x=content_x + content_width - padding_right)
+    end
+    
     # Set edit input style
     m.edit_area.style = edit_style
     m.edit_area.cursor_style = cursor_style
     m.edit_area.focused = true
     m.edit_area.tick = m.tick
     
-    # Render edit input (below the label)
+    # Render edit input (below the label and attachments)
     inner_area = Rect(
         content_x + padding_left, 
-        area.y + padding_top + 1,  # +1 for label row
+        area.y + padding_top + 1 + attachment_lines,  # +1 for label row, +attachment_lines for attachments
         content_width - padding_left - padding_right, 
-        area.height - padding_top - padding_bottom - 1
+        area.height - padding_top - padding_bottom - 1 - attachment_lines
     )
     render(m.edit_area, inner_area, buf)
 end
@@ -2300,6 +2794,10 @@ function _render_modal!(m::TuiModel, buf::Buffer, area::Rect)
         _render_delete_modal!(m, buf, area)
     elseif m.modal == MODAL_MODEL_SELECT
         _render_model_select_modal!(m, buf, area)
+    elseif m.modal == MODAL_DIFF_VIEW
+        _render_diff_view_modal!(m, buf, area)
+    elseif m.modal == MODAL_SYSTEM_PROMPT
+        _render_system_prompt_modal!(m, buf, area)
     end
 end
 
@@ -2347,10 +2845,259 @@ function _render_model_select_modal!(m::TuiModel, buf::Buffer, area::Rect)
     set_string!(buf, content.x + 1, help_y, "Enter:select Esc:cancel", GREY_DIM)
 end
 
+function _render_diff_view_modal!(m::TuiModel, buf::Buffer, area::Rect)
+    # Title showing file path
+    title = " File Edit: $(basename(m.diff_view_path)) "
+    title_style = Style(fg=ColorRGB(255, 200, 100), bold=true)
+    
+    # Calculate modal dimensions (use most of the screen)
+    modal_width = min(100, area.width - 4)
+    modal_height = min(40, area.height - 4)
+    modal_rect = center(area, modal_width, modal_height)
+    
+    # Draw border
+    block = Block(
+        title=title,
+        border_style=Style(fg=Color256(245)),
+        title_style=title_style,
+        box=BOX_HEAVY,
+    )
+    content = render(block, modal_rect, buf)
+    
+    # Calculate diff using DiffUtils for proper unified diff
+    old_lines = collect(eachline(IOBuffer(m.diff_view_old)))
+    new_lines = collect(eachline(IOBuffer(m.diff_view_new)))
+    
+    # Generate unified diff
+    diff_result = DiffUtils.diff(old_lines, new_lines; context=3)
+    diff_str = sprint(io -> DiffUtils.export_unified(io, diff_result, 
+        old_label="a/$(basename(m.diff_view_path))",
+        new_label="b/$(basename(m.diff_view_path))"))
+    
+    # Split into lines for rendering
+    diff_lines = split(diff_str, '\n')
+    
+    # If no changes detected
+    if isempty(diff_lines) || (length(diff_lines) == 1 && isempty(diff_lines[1]))
+        diff_lines = ["(No changes)"]
+    end
+    
+    # Render diff lines with unified diff format
+    max_lines = content.height - 3  # Leave room for help text
+    y_offset = 0
+    
+    for (i, line) in enumerate(diff_lines)
+        i > max_lines && break
+        
+        y = content.y + y_offset
+        
+        # Style based on unified diff format
+        if startswith(line, "---") || startswith(line, "+++")
+            # File headers - yellow
+            line_style = Style(fg=ColorRGB(255, 255, 100), bold=true)
+        elseif startswith(line, "@@")
+            # Hunk headers - cyan
+            line_style = Style(fg=ColorRGB(100, 255, 255))
+        elseif startswith(line, "-")
+            # Removed - red
+            line_style = Style(fg=ColorRGB(255, 100, 100))
+        elseif startswith(line, "+")
+            # Added - green
+            line_style = Style(fg=ColorRGB(100, 255, 100))
+        elseif startswith(line, " ") || isempty(line)
+            # Context lines - grey
+            line_style = Style(fg=Color256(245))
+        else
+            # Other (like "No changes") - white
+            line_style = Style(fg=ColorRGB(255, 255, 255))
+        end
+        
+        # Truncate long lines
+        display_line = length(line) > content.width - 2 ? line[1:content.width-5] * "..." : line
+        
+        set_string!(buf, content.x + 1, y, display_line, line_style; max_x=content.x + content.width - 2)
+        y_offset += 1
+    end
+    
+    # Help text at bottom
+    help_y = bottom(content) - 1
+    help_text = "y:confirm n:cancel"
+    help_x = content.x + div(content.width - length(help_text), 2)
+    set_string!(buf, help_x, help_y, help_text, Style(fg=ColorRGB(255, 255, 255), bold=true))
+end
+
+"""
+    show_diff_view!(m::TuiModel, path::String, old_content::String, new_content::String, tool_call)
+
+Show a diff view modal for file editing, asking user for confirmation.
+"""
+function show_diff_view!(m::TuiModel, path::String, old_content::String, new_content::String, tool_call)
+    m.diff_view_path = path
+    m.diff_view_old = old_content
+    m.diff_view_new = new_content
+    m.diff_view_tool_call = tool_call
+    m.modal = MODAL_DIFF_VIEW
+    _set_status!(m, "Review changes to $(basename(path)) - y:confirm n:cancel")
+end
+
+"""
+    _execute_diff_tool_call!(m::TuiModel)
+
+Execute the stored tool call after user confirms in diff view.
+"""
+function _execute_diff_tool_call!(m::TuiModel)
+    if m.diff_view_tool_call === nothing
+        _set_status!(m, "No tool call to execute")
+        return
+    end
+    
+    # Execute the tool
+    tc = m.diff_view_tool_call
+    tool_name_str = call_name(tc)
+    args = call_arguments(tc)
+    
+    _set_status!(m, "Executing $tool_name_str...")
+    
+    # Execute in async task
+    @async begin
+        try
+            result = execute_tool(tool_name_str, args)
+            
+            if result.success
+                _set_status!(m, "✓ File edited: $(basename(m.diff_view_path))")
+            else
+                _set_status!(m, "✗ Failed: $(result.error)")
+            end
+        catch e
+            _set_status!(m, "✗ Error: $e")
+        end
+        
+        # Clear diff view state
+        m.diff_view_path = ""
+        m.diff_view_old = ""
+        m.diff_view_new = ""
+        m.diff_view_tool_call = nothing
+    end
+end
+
+"""
+    _show_system_prompt_modal!(m::TuiModel)
+
+Show the system prompt in a scrollable modal view.
+"""
+function _show_system_prompt_modal!(m::TuiModel)
+    m.modal = MODAL_SYSTEM_PROMPT
+    _set_status!(m, "System Prompt - Press Esc or q to close")
+end
+
+"""
+    _render_system_prompt_modal!(m::TuiModel, buf::Buffer, area::Rect)
+
+Render the system prompt modal with scrollable content.
+"""
+function _render_system_prompt_modal!(m::TuiModel, buf::Buffer, area::Rect)
+    # Title
+    title = " System Prompt - Diff-First Development Rules "
+    title_style = Style(fg=ColorRGB(100, 255, 100), bold=true)
+    
+    # Calculate modal dimensions (use most of the screen)
+    modal_width = min(100, area.width - 4)
+    modal_height = min(40, area.height - 4)
+    modal_rect = center(area, modal_width, modal_height)
+    
+    # Draw border
+    block = Block(
+        title=title,
+        border_style=Style(fg=Color256(245)),
+        title_style=title_style,
+        box=BOX_HEAVY,
+    )
+    content = render(block, modal_rect, buf)
+    
+    # Load and display system prompt
+    prompt_text = load_system_prompt()
+    if isempty(prompt_text)
+        prompt_text = "No system prompt found.\n\nExpected at: $SYSTEM_PROMPT_PATH"
+    end
+    
+    # Split into lines
+    lines = split(prompt_text, '\n')
+    
+    # Render lines with syntax highlighting for rules
+    max_lines = content.height - 3  # Leave room for help text
+    y_offset = 0
+    
+    for (i, line) in enumerate(lines)
+        i > max_lines && break
+        
+        y = content.y + y_offset
+        
+        # Style based on content
+        if startswith(line, "#")
+            # Headers - green bold
+            line_style = Style(fg=ColorRGB(100, 255, 100), bold=true)
+        elseif startswith(line, "-") && contains(line, "❌")
+            # Forbidden - red
+            line_style = Style(fg=ColorRGB(255, 100, 100))
+        elseif startswith(line, "-") && contains(line, "✅")
+            # Required - green
+            line_style = Style(fg=ColorRGB(100, 255, 100))
+        elseif startswith(line, "###") || contains(line, "NEVER") || contains(line, "ALWAYS")
+            # Important rules - yellow
+            line_style = Style(fg=ColorRGB(255, 255, 100), bold=true)
+        elseif startswith(line, "```")
+            # Code blocks - grey
+            line_style = Style(fg=Color256(240))
+        else
+            # Normal text - white
+            line_style = Style(fg=ColorRGB(255, 255, 255))
+        end
+        
+        # Truncate long lines
+        display_line = length(line) > content.width - 2 ? line[1:content.width-5] * "..." : line
+        
+        set_string!(buf, content.x + 1, y, display_line, line_style; max_x=content.x + content.width - 2)
+        y_offset += 1
+    end
+    
+    # Help text at bottom
+    help_y = bottom(content) - 1
+    help_text = "Esc/q:close"
+    help_x = content.x + div(content.width - length(help_text), 2)
+    set_string!(buf, help_x, help_y, help_text, Style(fg=ColorRGB(255, 255, 255), bold=true))
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# System Prompt
+# ═══════════════════════════════════════════════════════════════════════
+const SYSTEM_PROMPT_PATH = joinpath(dirname(@__FILE__), "..", "prompts", "system.md")
+
+function load_system_prompt()::String
+    isfile(SYSTEM_PROMPT_PATH) ? read(SYSTEM_PROMPT_PATH, String) : ""
+end
+
+function show_system_prompt()
+    prompt = load_system_prompt()
+    if !isempty(prompt)
+        println("\n" * "="^60)
+        println("SYSTEM PROMPT")
+        println("="^60)
+        println(prompt)
+        println("="^60 * "\n")
+    else
+        println("No system prompt found at: $SYSTEM_PROMPT_PATH")
+    end
+end
+
 # ═══════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════
-function flooty_sessions_tui()
+function flooty_sessions_tui(; show_prompt::Bool=false)
+    # Show system prompt if requested
+    if show_prompt
+        show_system_prompt()
+    end
+    
     model = TuiModel()
     
     # Try to load existing sessions from sessions.json

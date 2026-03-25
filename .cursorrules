@@ -1,0 +1,62 @@
+# FlootySessions Development Guidelines
+
+## Code Change Protocol
+
+### BEFORE Any Code Edit:
+1. **Present a diff view** showing exactly what will change
+2. **Explain the rationale** for the change
+3. **Wait for user confirmation** before applying
+
+### Change Scope Rules:
+- **One function at a time** -or-
+- **One struct at a time** -or-
+- **One small logical change**
+
+### NEVER:
+- ❌ Bulk edit multiple unrelated functions
+- ❌ Modify more than 50 lines at once
+- ❌ Change files without showing the diff first
+- ❌ Mix refactoring with feature changes
+
+### ALWAYS:
+- ✅ Show unified diff with context
+- ✅ Explain what and why
+- ✅ Make minimal, focused changes
+- ✅ Verify imports and dependencies
+- ✅ Test after each change
+
+## Diff View Format
+
+When presenting changes, use:
+
+```
+## Proposed Change: `function_name` in `file.jl`
+
+**Rationale:** Brief explanation
+
+```diff
+--- a/file.jl
++++ b/file.jl
+@@ -10,5 +10,5 @@
+ function old_name()
+-    old_code
++    new_code
+ end
+```
+
+**Confirm:** y/n
+```
+
+## Attachment Handling
+
+When working with attachments:
+1. Store only paths in metadata
+2. Load actual data on demand
+3. Handle permission errors gracefully
+4. Show 📎 indicator in UI
+
+## Session Persistence
+
+- JSON files store paths only (no base64)
+- Restore attachments on load
+- Skip missing files with warnings
