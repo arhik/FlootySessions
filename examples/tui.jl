@@ -1839,7 +1839,7 @@ function _generate_session_name(agent::Agent, first_message::String)::String
     # Use the same provider and model but empty context
     try
         prov = provider(agent)
-        temp_agent = create_agent("NamingAgent", prov; model=agent.model)
+        temp_agent = Agent("NamingAgent", prov; model=agent.model, tools=AbstractTool[])
         
         naming_prompt = """Suggest a concise session name (2-4 words) for a conversation that starts with this query: \"$first_message\"
 
