@@ -860,7 +860,9 @@ function _switch_to_session!(m::TuiModel, idx::Int)
     # Ensure session has a valid agent
     if session.root_agent === nothing
         # Create a new agent if none exists
-        agent = create_agent("Assistant", :ollama)
+        # Pass session tools to the new agent
+        agent_tools = isempty(session.tools) ? list_default_tools() : session.tools
+        agent = create_agent("Assistant", :ollama; tools=agent_tools)
         session.root_agent = agent
         session.active_agent_id = agent.id
     end

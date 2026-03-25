@@ -29,6 +29,12 @@ function Session(name::String;
                  tools::Vector{<:AbstractTool}=list_default_tools())
     now_time = now()
     active_id = root_agent !== nothing ? root_agent.id : nothing
+    
+    # Pass session tools to root_agent if agent has no tools
+    if root_agent !== nothing && isempty(root_agent.tools) && !isempty(tools)
+        root_agent.tools = tools
+    end
+    
     Session(
         uuid4(),
         name,
