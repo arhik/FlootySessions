@@ -18,9 +18,19 @@ export set_active_agent!
 export list_default_tools
 export get_messages, add_message!
 
+# Permission system exports
+export ToolPermission, PermissionStatus, PERMISSION_PENDING, PERMISSION_GRANTED, PERMISSION_DENIED, PERMISSION_REVOKED
+export ToolPermissionRequest, ToolPermissionResponse
+export PermissionStore, create_permission_store
+export request_tool_permission, resolve_permission_request, check_tool_permission
+export grant_permission, deny_permission, revoke_permission
+export initialize_permission_store!, get_permission_store
+export get_available_tools_with_permissions, format_permission_request
+
 include("session.jl")
 include("manager.jl")
 include("persistence.jl")
+include("permissions.jl")
 
 # Session - Mutable struct with abstract type fields
 StructTypes.StructType(::Type{Session}) = StructTypes.Mutable()
@@ -167,6 +177,261 @@ end
 function add_message!(session::Session, msg::FlootyAbstract.AbstractMessage)
     session.root_agent === nothing && return
     FlootyContextManager.add_message!(session.root_agent.context, msg)
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# Permission-Aware Tool Execution
+# ═══════════════════════════════════════════════════════════════════════
+
+"""
+    ToolExecutionState
+
+Tracks the state of a tool execution that requires permission.
+"""
+mutable struct ToolExecutionState
+    request::Union{ToolPermissionRequest,Nothing}
+    response::Union{ToolPermissionResponse,Nothing}
+    executed::Bool
+    result::Union{FlootyAbstract.ToolResult,Nothing}
+    error::String
+end
+
+ToolExecutionState() = ToolExecutionState(nothing, nothing, false, nothing, "")
+
+"""
+    prepare_tool_execution(session::Session, tool_name::String, 
+                          tool_description::String, 
+                          args::Dict{String,Any}) -> ToolExecutionState
+
+Prepare a tool execution, checking permissions and creating a permission request if needed.
+Returns a ToolExecutionState that the UI can use to show a permission modal.
+
+Usage:
+    state = prepare_tool_execution(session, "write", "Write file", args)
+    if state.request !== nothing && state.response === nothing
+        # Show permission modal with state.request
+        # When user decides, call submit_permission_response(session, state.request, approved)
+    else
+        # Execute directly: execute_with_permission(session, state)
+    end
+"""
+function prepare_tool_execution(session::Session, tool_name::String,
+                               tool_description::String,
+                               args::Dict{String,Any})
+    state = ToolExecutionState()
+    
+    # Ensure permission store exists
+    store = get_permission_store(session)
+    if store === nothing
+        store = initialize_permission_store!(session)
+    end
+    
+    # Check current permission status
+    allowed, pending_request = check_tool_permission(store, tool_name)
+    
+    if allowed
+        # Permission already granted
+        state.executed = true
+        return state
+    end
+    
+    if pending_request !== nothing
+        # There's already a pending request for this tool
+        state.request = pending_request
+        return state
+    end
+    
+    # Create a new permission request
+    request = ToolPermissionRequest(session.id, tool_name, tool_description, args)
+    request, auto_response = request_tool_permission(store, request)
+    
+    state.request = request
+    
+    if auto_response !== nothing
+        # Auto-granted or auto-denied based on remembered choice
+        state.response = auto_response
+        state.executed = auto_response.approved
+    end
+    
+    return state
+end
+
+"""
+    submit_permission_response(session::Session, request::ToolPermissionRequest, 
+                              approved::Bool; kwargs...) -> ToolExecutionState
+
+Submit a user's permission response and return the updated execution state.
+
+Usage:
+    state = prepare_tool_execution(session, ...)
+    # User clicks "Allow" or "Deny"
+    new_state = submit_permission_response(session, state.request, true)  # or false
+    result = execute_with_permission(session, new_state)
+"""
+function submit_permission_response(session::Session, request::ToolPermissionRequest,
+                                   approved::Bool; 
+                                   reason::String="",
+                                   remember_choice::Bool=false)
+    store = get_permission_store(session)
+    store === nothing && return ToolExecutionState()
+    
+    response = ToolPermissionResponse(request, approved; 
+                                     reason=reason, 
+                                     remember_choice=remember_choice)
+    resolve_permission_request(store, response)
+    
+    state = ToolExecutionState()
+    state.request = request
+    state.response = response
+    state.executed = approved
+    
+    return state
+end
+
+"""
+    execute_with_permission(session::Session, state::ToolExecutionState) -> FlootyAbstract.ToolResult
+
+Execute a tool call after permission has been granted.
+"""
+function execute_with_permission(session::Session, state::ToolExecutionState)
+    if !state.executed || state.request === nothing
+        return FlootyAbstract.ToolResult(false, "", "Permission not granted")
+    end
+    
+    tool_name = state.request.tool_name
+    args = state.request.arguments
+    
+    # Get the handler from FlootyAbstract's registry
+    handler = FlootyAbstract.get_tool_handler(tool_name)
+    
+    if handler === nothing
+        return FlootyAbstract.ToolResult(false, "", "No handler for tool: $tool_name")
+    end
+    
+    # Execute the handler
+    try
+        result = handler(args; context=session)
+        state.result = result
+        return result
+    catch e
+        error_msg = "Tool execution failed: $e"
+        state.error = error_msg
+        return FlootyAbstract.ToolResult(false, "", error_msg)
+    end
+end
+
+"""
+    execute_tool_with_permission(session::Session, tool_name::String, 
+                                args::Dict{String,Any}; 
+                                tool_description::String="",
+                                auto_execute::Bool=false) -> Union{ToolExecutionState, FlootyAbstract.ToolResult}
+
+High-level function to execute a tool with permission checking.
+
+If auto_execute=true and permission is already granted, returns the ToolResult directly.
+Otherwise returns a ToolExecutionState for the UI to handle.
+"""
+function execute_tool_with_permission(session::Session, tool_name::String,
+                                     args::Dict{String,Any};
+                                     tool_description::String="",
+                                     auto_execute::Bool=false)
+    # Get tool description if not provided
+    if isempty(tool_description)
+        for tool in session.tools
+            if tool.name == tool_name
+                tool_description = tool.description
+                break
+            end
+        end
+    end
+    
+    state = prepare_tool_execution(session, tool_name, tool_description, args)
+    
+    # If auto_execute is true and we have permission, execute immediately
+    if auto_execute && state.executed && state.response !== nothing
+        return execute_with_permission(session, state)
+    end
+    
+    # Return state for UI to handle
+    return state
+end
+
+"""
+    get_session_tools_for_ui(session::Session) -> Dict{String,Any}
+
+Get all information needed by the UI to display tools and permissions.
+Returns a Dict with:
+    - session_id: UUID
+    - tools: Vector of tool info with permission status
+    - pending_requests: Vector of pending permission requests
+    - permission_mode: String ("prompt_each", "remember_session", "auto_grant_safe")
+"""
+function get_session_tools_for_ui(session::Session)
+    store = get_permission_store(session)
+    
+    result = Dict{String,Any}(
+        "session_id" => string(session.id),
+        "tools" => get_available_tools_with_permissions(session),
+        "permission_mode" => get(session.metadata, "permission_mode", "prompt_each")
+    )
+    
+    if store !== nothing
+        result["pending_requests"] = [Dict(
+            "request_id" => string(req.request_id),
+            "tool_name" => req.tool_name,
+            "tool_description" => req.tool_description,
+            "arguments_preview" => req.arguments_preview,
+            "created_at" => string(req.created_at),
+            "timeout_seconds" => req.timeout_seconds
+        ) for req in values(store.pending_requests)]
+        
+        result["granted_permissions"] = [Dict(
+            "tool_name" => perm.tool_name,
+            "status" => string(perm.status),
+            "granted_at" => perm.granted_at !== nothing ? string(perm.granted_at) : nothing,
+            "expires_at" => perm.expires_at !== nothing ? string(perm.expires_at) : nothing
+        ) for perm in values(store.tool_permissions) if perm.status == PERMISSION_GRANTED]
+    else
+        result["pending_requests"] = []
+        result["granted_permissions"] = []
+    end
+    
+    result
+end
+
+"""
+    set_permission_mode!(session::Session, mode::String)
+
+Set the permission mode for a session:
+    - "prompt_each": Ask for permission on each tool call (default)
+    - "remember_session": Remember choices for the session duration
+    - "auto_grant_safe": Auto-grant safe tools (read, ls, pwd)
+    - "auto_grant_all": Auto-grant all tools (use with caution!)
+"""
+function set_permission_mode!(session::Session, mode::String)
+    valid_modes = ["prompt_each", "remember_session", "auto_grant_safe", "auto_grant_all"]
+    mode in valid_modes || throw(ArgumentError("Invalid permission mode: $mode"))
+    
+    session.metadata["permission_mode"] = mode
+    
+    store = get_permission_store(session)
+    if store === nothing
+        store = initialize_permission_store!(session)
+    end
+    
+    if mode == "auto_grant_safe"
+        # Grant safe tools for 60 minutes
+        for tool in ["pwd", "ls", "read", "diffview"]
+            grant_permission(store, tool; duration_minutes=60)
+        end
+    elseif mode == "auto_grant_all"
+        # Grant all tools with no expiration
+        for tool in session.tools
+            grant_permission(store, tool.name)
+        end
+    end
+    
+    mode
 end
 
 function __init__()
