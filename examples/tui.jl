@@ -260,9 +260,9 @@ function render_widget(buf::Buffer, widget::MessageWidget, x::Int, y::Int, max_y
 
     content_start_y = y + padding_top
 
-    # Fill widget background with base style (subtle tint)
+    # Fill widget background with base style (subtle tint) - clipped to buffer bounds
     for row_y in y:min(y + total_height - 1, max_y - 1)
-        for cx in x:(x + widget.width - 1)
+        for cx in x:min(x + widget.width - 1, buf.area.width - 1)
             set_char!(buf, cx, row_y, ' ', base_style)
         end
     end
@@ -343,16 +343,9 @@ function render_widget(buf::Buffer, widget::MessageWidget, x::Int, y::Int, max_y
                     # Access Span fields directly
                     span_text = span.content
                     span_style = span.style
-                    # Merge with base background
-                    merged_style = Style(
-                        fg=span_style.fg,
-                        bg=base_style.bg,  # Keep message background
-                        bold=span_style.bold,
-                        dim=span_style.dim,
-                        italic=span_style.italic,
-                        underline=span_style.underline
-                    )
-                    set_string!(buf, current_x, line_y, span_text, merged_style)
+                    # Only use span's styling (foreground colors), don't add background
+                    # This prevents background color bleeding/spilling
+                    set_string!(buf, current_x, line_y, span_text, span_style)
                     current_x += length(span_text)
                 end
             end
