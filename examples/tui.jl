@@ -781,6 +781,9 @@ end
     # Tool Permission System
     pending_tool_calls::Vector{Tuple{Symbol, Dict{String,Any}, ToolExecutionState}} = []
     tool_permission_remember::Bool = false
+    waiting_for_tool_permission::Bool = false  # NEW: Waiting for user y/n/r
+    current_tool_call::Any = nothing  # NEW: Current tool being approved/denied
+    permission_agent::Any = nothing  # NEW: Agent for continuing after tool
 
     # Model selection
     available_models::Vector{String} = [
@@ -966,6 +969,21 @@ function _handle_key!(m::TuiModel, evt::KeyEvent)
     if m.modal != MODAL_NONE
         _handle_modal_key!(m, evt)
         return
+    end
+
+    # Tool permission handling (inline system message approach)
+    if m.waiting_for_tool_permission && m.current_tool_call !== nothing
+        if evt.key == :char && (evt.char == 'y' || evt.char == 'Y')
+            _approve_tool_inline!(m; remember=m.tool_permission_remember)
+            return
+        elseif evt.key == :char && (evt.char == 'n' || evt.char == 'N')
+            _deny_tool_inline!(m)
+            return
+        elseif evt.key == :char && (evt.char == 'r' || evt.char == 'R')
+            m.tool_permission_remember = !m.tool_permission_remember
+            _set_status!(m, m.tool_permission_remember ? "Will remember choice" : "Won't remember choice")
+            return
+        end
     end
 
     # Global shortcuts
@@ -1292,24 +1310,7 @@ function _handle_modal_key!(m::TuiModel, evt::KeyEvent)
         if evt.key == :escape || evt.key == :char && evt.char == 'q'
             m.modal = MODAL_NONE
         end
-    elseif m.modal == MODAL_TOOL_PERMISSION
-        # Tab toggles between Confirm(Allow) and Cancel(Deny)
-        if evt.key == :tab
-            m.modal_selected = m.modal_selected == :confirm ? :cancel : :confirm
-        # Space toggles remember checkbox
-        elseif evt.key == :char && evt.char == ' '
-            m.tool_permission_remember = !m.tool_permission_remember
-        elseif evt.key == :left
-            m.modal_selected = :cancel
-        elseif evt.key == :right
-            m.modal_selected = :confirm
-        elseif evt.key == :enter
-            _handle_tool_permission_response!(m)
-        elseif evt.key == :escape
-            # Escape denies the tool
-            m.modal_selected = :cancel
-            _handle_tool_permission_response!(m)
-        end
+    # MODAL_TOOL_PERMISSION removed - using inline system messages instead
     end
 end
 
@@ -1956,7 +1957,7 @@ function _send_message!(m::TuiModel)
 
                 # Process tool calls with permission system
                 if !(result isa AbstractFlootyError)
-                    _process_tool_calls_silent!(m, agent, result)
+                    _process_tool_calls_inline!(m, agent, result)
                 end
 
                 put!(result_channel, result)
@@ -2010,7 +2011,7 @@ function _send_message!(m::TuiModel)
 
                 # Process tool calls with permission system
                 if !(result isa AbstractFlootyError)
-                    _process_tool_calls_silent!(m, agent, result)
+                    _process_tool_calls_inline!(m, agent, result)
                 end
 
                 put!(result_channel, result)
@@ -2116,7 +2117,7 @@ function _trigger_llm_response!(m::TuiModel, edited_text::String, attachments::V
 
                 # Process tool calls with permission system
                 if !(result isa AbstractFlootyError)
-                    _process_tool_calls_silent!(m, agent, result)
+                    _process_tool_calls_inline!(m, agent, result)
                 end
 
                 put!(result_channel, result)
@@ -2158,7 +2159,7 @@ function _trigger_llm_response!(m::TuiModel, edited_text::String, attachments::V
 
                 # Process tool calls with permission system
                 if !(result isa AbstractFlootyError)
-                    _process_tool_calls_silent!(m, agent, result)
+                    _process_tool_calls_inline!(m, agent, result)
                 end
 
                 put!(result_channel, result)
@@ -2870,8 +2871,7 @@ function _render_modal!(m::TuiModel, buf::Buffer, area::Rect)
         _render_diff_view_modal!(m, buf, area)
     elseif m.modal == MODAL_SYSTEM_PROMPT
         _render_system_prompt_modal!(m, buf, area)
-    elseif m.modal == MODAL_TOOL_PERMISSION
-        _render_tool_permission_modal!(m, buf, area)
+    # MODAL_TOOL_PERMISSION removed - using inline system messages instead
     end
 end
 
@@ -3140,6 +3140,246 @@ function _render_system_prompt_modal!(m::TuiModel, buf::Buffer, area::Rect)
     help_x = content.x + div(content.width - length(help_text), 2)
     set_string!(buf, help_x, help_y, help_text, Style(fg=ColorRGB(255, 255, 255), bold=true))
 end
+
+"""
+    _process_tool_calls_inline!(m::TuiModel, agent::Agent, response) -> Bool
+
+Process tool calls by adding system messages to chat instead of modal.
+Returns true if processing should continue (no tools or all executed),
+false if waiting for user permission.
+"""
+function _process_tool_calls_inline!(m::TuiModel, agent::Agent, response)::Bool
+    if hasproperty(response, :message) && response.message !== nothing
+        tcs = tool_calls(response.message)
+        if tcs === nothing || isempty(tcs)
+            return true
+        end
+        
+        _debug_log("Processing $(length(tcs)) tool calls inline")
+        
+        # Store agent for later use
+        m.permission_agent = agent
+        
+        # Add system messages for each tool call
+        for tc in tcs
+            tool_name = call_name(tc)
+            args = call_arguments(tc)
+            
+            # Format the tool request message
+            args_str = ""
+            if !isempty(args)
+                parts = String[]
+                for (k, v) in args
+                    v_str = string(v)
+                    if length(v_str) > 50
+                        v_str = v_str[1:47] * "..."
+                    end
+                    push!(parts, "$k=$v_str")
+                end
+                args_str = join(parts, ", ")
+            else
+                args_str = "no arguments"
+            end
+            
+            # Create system message showing permission request
+            prov = provider(agent)
+            cmd_str = !isempty(args) ? join(["$k=$v" for (k, v) in args], " ") : ""
+            tool_request_msg = """🔧 Tool Request: $tool_name $cmd_str
+
+   Press 'y' to allow | 'n' to deny | 'r' to remember"""
+            
+            sys_msg = create_message(prov, "system", tool_request_msg)
+            add_message!(context(agent), sys_msg)
+            
+            # Add to pending queue
+            store = get_permission_store(m.current_session)
+            if store === nothing
+                store = initialize_permission_store!(m.current_session)
+                set_permission_mode!(m.current_session, "auto_grant_safe")
+            end
+            
+            tool_desc = ""
+            for t in m.current_session.tools
+                if t.name == tool_name
+                    tool_desc = t.description
+                    break
+                end
+            end
+            isempty(tool_desc) && (tool_desc = "Execute $tool_name")
+            
+            state = prepare_tool_execution(m.current_session, tool_name, tool_desc, args)
+            push!(m.pending_tool_calls, (Symbol(tool_name), args, state))
+        end
+        
+        # Set waiting state for first tool
+        if !isempty(m.pending_tool_calls)
+            m.waiting_for_tool_permission = true
+            m.current_tool_call = m.pending_tool_calls[1]
+            _set_status!(m, "Tool requests added - press 'y' to allow, 'n' to deny")
+            return false  # Waiting for user
+        end
+    end
+    return true
+end
+
+"""
+    _approve_tool_inline!(m::TuiModel; remember::Bool=false)
+
+Approve the current tool and execute it.
+"""
+function _approve_tool_inline!(m::TuiModel; remember::Bool=false)
+    isempty(m.pending_tool_calls) && (m.waiting_for_tool_permission = false; return)
+    m.current_tool_call === nothing && (m.waiting_for_tool_permission = false; return)
+    
+    tool_name, args, state = m.current_tool_call
+    agent = m.permission_agent
+    agent === nothing && (m.waiting_for_tool_permission = false; return)
+    
+    # Check if request exists
+    if state.request === nothing
+        # No request was created - execute directly
+        popfirst!(m.pending_tool_calls)
+        @async begin
+            try
+                result = execute_tool(string(tool_name), args)
+                args_str = join(["$k=$v" for (k, v) in args], " ")
+                output = result.success ? result.data : "Error: $(result.error)"
+                tool_content = """\$ $tool_name $args_str
+$output"""
+                tool_msg = create_message(provider(agent), "tool", tool_content)
+                add_message!(context(agent), tool_msg)
+                _set_status!(m, "✓ Executed: $tool_name")
+            catch e
+                _set_status!(m, "✗ Error: $e")
+            end
+        end
+        return
+    end
+    
+    # Submit approval
+    response = submit_permission_response(m.current_session, state.request, true; remember_choice=remember)
+    
+    # Remove from queue
+    popfirst!(m.pending_tool_calls)
+    
+    # Execute the tool
+    @async begin
+        try
+            result = execute_with_permission(m.current_session, response)
+            
+            if result.success
+                # Format and add tool result
+                args_str = join(["$k=$v" for (k, v) in args], " ")
+                output = result.success ? result.data : "Error: $(result.error)"
+                tool_content = """\$ $tool_name $args_str
+$output"""
+                tool_msg = create_message(provider(agent), "tool", tool_content)
+                add_message!(context(agent), tool_msg)
+                _set_status!(m, "✓ Executed: $tool_name")
+            else
+                _set_status!(m, "✗ Failed: $(result.error)")
+            end
+            
+            # Move to next tool or continue chat
+            if !isempty(m.pending_tool_calls)
+                m.current_tool_call = m.pending_tool_calls[1]
+                tc = m.current_tool_call
+                tool_name = tc[1]
+                _set_status!(m, "Next tool: $tool_name - press 'y' to allow, 'n' to deny")
+            else
+                # All tools done, continue chat
+                m.waiting_for_tool_permission = false
+                m.current_tool_call = nothing
+                _continue_after_tools_inline!(m, agent)
+            end
+        catch e
+            _set_status!(m, "✗ Error: $e")
+            m.waiting_for_tool_permission = false
+            m.current_tool_call = nothing
+        end
+    end
+end
+
+"""
+    _deny_tool_inline!(m::TuiModel)
+
+Deny the current tool and add denial message.
+"""
+function _deny_tool_inline!(m::TuiModel)
+    isempty(m.pending_tool_calls) && (m.waiting_for_tool_permission = false; return)
+    m.current_tool_call === nothing && (m.waiting_for_tool_permission = false; return)
+    
+    tool_name, args, state = m.current_tool_call
+    agent = m.permission_agent
+    agent === nothing && (m.waiting_for_tool_permission = false; return)
+    
+    # Check if request exists
+    if state.request === nothing
+        # No request was created - just skip this tool
+        popfirst!(m.pending_tool_calls)
+        prov = provider(agent)
+        denial_msg = create_message(prov, "tool", "\$ $tool_name ...\n\n[SKIPPED - Denied by user]")
+        add_message!(context(agent), denial_msg)
+        _set_status!(m, "✗ Denied: $tool_name")
+        
+        # Move to next or end
+        if !isempty(m.pending_tool_calls)
+            m.current_tool_call = m.pending_tool_calls[1]
+        else
+            m.waiting_for_tool_permission = false
+            m.current_tool_call = nothing
+            _continue_after_tools_inline!(m, agent)
+        end
+        return
+    end
+    
+    # Submit denial
+    response = submit_permission_response(m.current_session, state.request, false; remember_choice=false)
+    
+    # Remove from queue
+    popfirst!(m.pending_tool_calls)
+    
+    # Add denial message
+    prov = provider(agent)
+    denial_msg = create_message(prov, "system", "Tool '$tool_name' was denied by user.")
+    add_message!(context(agent), denial_msg)
+    _set_status!(m, "✗ Denied: $tool_name")
+    
+    # Move to next tool or continue
+    if !isempty(m.pending_tool_calls)
+        m.current_tool_call = m.pending_tool_calls[1]
+        tc = m.current_tool_call
+        tool_name = tc[1]
+        _set_status!(m, "Next tool: $tool_name - press 'y' to allow, 'n' to deny")
+    else
+        m.waiting_for_tool_permission = false
+        m.current_tool_call = nothing
+        _continue_after_tools_inline!(m, agent)
+    end
+end
+
+"""
+    _continue_after_tools_inline!(m::TuiModel, agent::Agent)
+
+Continue chat after all tools have been processed.
+"""
+function _continue_after_tools_inline!(m::TuiModel, agent::Agent)
+    @async begin
+        try
+            response = FlootyAgents._do_chat(agent, false, false)
+            if response isa AbstractFlootyError
+                _set_status!(m, "Chat error: $(response.message)")
+                return
+            end
+            # Don't auto-process more tools - let user see response first
+        catch e
+            _set_status!(m, "Error continuing chat: $e")
+        end
+    end
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# Main
 
 # ═══════════════════════════════════════════════════════════════════════
 # System Prompt

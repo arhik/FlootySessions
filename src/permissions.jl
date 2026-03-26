@@ -180,7 +180,7 @@ function resolve_permission_request(store::PermissionStore, response::ToolPermis
         perm = ToolPermission(response.tool_name;
             status=response.approved ? PERMISSION_GRANTED : PERMISSION_DENIED,
             granted_at=response.approved_at,
-            metadata=Dict("reason" => response.reason))
+            metadata=Dict{String,Any}("reason" => response.reason))
         store.tool_permissions[response.tool_name] = perm
     end
     
@@ -236,7 +236,7 @@ Grant permission for a tool. Optionally specify duration in minutes.
 """
 function grant_permission(store::PermissionStore, tool_name::String;
                          duration_minutes::Union{Int,Nothing}=nothing,
-                         metadata::Dict{String,Any}=Dict())
+                         metadata::Dict{String,Any}=Dict{String,Any}())
     expires = duration_minutes !== nothing ? now() + Minute(duration_minutes) : nothing
     perm = ToolPermission(tool_name;
         status=PERMISSION_GRANTED,
@@ -266,7 +266,7 @@ Deny permission for a tool.
 function deny_permission(store::PermissionStore, tool_name::String; reason::String="")
     perm = ToolPermission(tool_name;
         status=PERMISSION_DENIED,
-        metadata=Dict("reason" => reason))
+        metadata=Dict{String,Any}("reason" => reason))
     store.tool_permissions[tool_name] = perm
     
     # Notify callbacks
