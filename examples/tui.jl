@@ -258,15 +258,14 @@ function render_widget(buf::Buffer, widget::MessageWidget, x::Int, y::Int, max_y
     footer_height = has_metadata ? 1 : 0
     total_height = padding_top + header_height + content_height + gap_height + footer_height + padding_bottom
 
-    # Fill entire widget background first (including all padding)
-    for row_y in y:(y + total_height - 1)
-        row_y >= max_y && break
+    content_start_y = y + padding_top
+
+    # Fill widget background with base style (subtle tint)
+    for row_y in y:min(y + total_height - 1, max_y - 1)
         for cx in x:(x + widget.width - 1)
             set_char!(buf, cx, row_y, ' ', base_style)
         end
     end
-
-    content_start_y = y + padding_top
 
     # In-place editing mode - use TextArea widget
     if widget.is_editing
@@ -789,7 +788,7 @@ end
 
     # Tool Permission System
     pending_tool_calls::Vector{Tuple{Symbol, Dict{String,Any}, ToolExecutionState}} = []
-    executing_tool_calls::Set{Symbol} = Set{Symbol}()  # Track which tools are currently executing
+    tool_tasks::Vector{Task} = []  # Store async tasks to wait for completion
     tool_permission_remember::Bool = false
     waiting_for_tool_permission::Bool = false  # NEW: Waiting for user y/n/r
     current_tool_call::Any = nothing  # NEW: Current tool being approved/denied
@@ -2619,23 +2618,24 @@ end
 function _render_scrollbar!(buf::Buffer, area::Rect, scroll_offset::Int, total_height::Int, viewport_height::Int)
     total_height <= viewport_height && return  # No scrollbar needed
 
-    scrollbar_style = Style(fg=Color256(245), bg=Color256(240))
-    thumb_style = Style(fg=Color256(255), bg=Color256(250))
-
-    # Draw scrollbar track
-    for y in area.y:bottom(area)
-        set_char!(buf, area.x, y, '│', scrollbar_style)
-    end
+    # Track is dim background, thumb is bright foreground
+    track_style = Style(fg=Color256(240), bg=Color256(240))  # Dark grey track
+    thumb_style = Style(fg=Color256(255), bg=Color256(255))  # White thumb
 
     # Calculate thumb position and size
     thumb_ratio = viewport_height / total_height
     thumb_size = max(1, round(Int, viewport_height * thumb_ratio))
     max_scroll = total_height - viewport_height
-    scroll_ratio = scroll_offset / max_scroll
+    scroll_ratio = scroll_offset / max(max_scroll, 1)
     thumb_pos = area.y + round(Int, (area.height - thumb_size) * scroll_ratio)
     thumb_pos = clamp(thumb_pos, area.y, bottom(area) - thumb_size + 1)
 
-    # Draw thumb
+    # Draw scrollbar track (dim background)
+    for y in area.y:bottom(area)
+        set_char!(buf, area.x, y, '│', track_style)
+    end
+
+    # Draw thumb (bright block)
     for y in thumb_pos:min(thumb_pos + thumb_size - 1, bottom(area))
         set_char!(buf, area.x, y, '█', thumb_style)
     end
@@ -2792,19 +2792,29 @@ function _render_edit_input!(m::TuiModel, buf::Buffer, area::Rect)
 end
 
 function _render_activity_panel!(m::TuiModel, buf::Buffer, area::Rect)
-    # Background activity panel - shows spinner only for CURRENT session
+    # Background activity panel - shows spinner for streaming OR tool execution
     is_this_session_streaming = m.current_session !== nothing && m.streaming_session_id == m.current_session.id
+    is_tool_executing = m.current_session !== nothing && !isempty(m.tool_tasks)
+    
     if is_this_session_streaming
         spinners = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
         spinner_idx = (m.tick ÷ 5) % length(spinners) + 1
         spinner_char = spinners[spinner_idx]
 
-        spinner_text = "$spinner_char Busy..."
-        # Green text, no background, with full padding (top, bottom, left, right)
-        spinner_style = Style(fg=ColorRGB(150, 255, 150))
-        # Apply padding: left=2, top=0 (centered vertically in 1-line area)
-        text_x = area.x + 2  # left padding
-        text_y = area.y + div(area.height - 1, 2)  # vertical center
+        spinner_text = "$spinner_char Streaming..."
+        spinner_style = Style(fg=ColorRGB(150, 255, 150))  # Green
+        text_x = area.x + 2
+        text_y = area.y + div(area.height - 1, 2)
+        set_string!(buf, text_x, text_y, spinner_text, spinner_style)
+    elseif is_tool_executing
+        spinners = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+        spinner_idx = (m.tick ÷ 5) % length(spinners) + 1
+        spinner_char = spinners[spinner_idx]
+
+        spinner_text = "$spinner_char Executing tool..."
+        spinner_style = Style(fg=ColorRGB(255, 200, 100))  # Amber
+        text_x = area.x + 2
+        text_y = area.y + div(area.height - 1, 2)
         set_string!(buf, text_x, text_y, spinner_text, spinner_style)
     end
 end
@@ -3176,7 +3186,7 @@ end
 """
     _process_tool_calls_inline!(m::TuiModel, agent::Agent, response) -> Bool
 
-Process tool calls by adding system messages to chat instead of modal.
+Process tool calls one at a time - only show first tool, then next after approval.
 Returns true if processing should continue (no tools or all executed),
 false if waiting for user permission.
 """
@@ -3187,83 +3197,18 @@ function _process_tool_calls_inline!(m::TuiModel, agent::Agent, response)::Bool
             return true
         end
         
-        _debug_log("Processing $(length(tcs)) tool calls inline")
+        _debug_log("Processing $(length(tcs)) tool calls inline (one at a time)")
+        _debug_log("Tool names: $([call_name(tc) for tc in tcs])")
         
         # Store agent for later use
         m.permission_agent = agent
         
-        # Add system messages for each tool call
+        # Queue all tools but only show FIRST one now
         for tc in tcs
             tool_name = call_name(tc)
             args = call_arguments(tc)
             
-            # Format the tool request message
-            args_str = ""
-            if !isempty(args)
-                parts = String[]
-                for (k, v) in args
-                    v_str = string(v)
-                    if length(v_str) > 50
-                        v_str = v_str[1:47] * "..."
-                    end
-                    push!(parts, "$k=$v_str")
-                end
-                args_str = join(parts, ", ")
-            else
-                args_str = "no arguments"
-            end
-            
-            # Check if this is a write/edit tool - show inline summary
-            if tool_name in ["write", "edit"] && haskey(args, "path")
-                path = args["path"]
-                new_content = get(args, "content", "")
-                
-                # Read existing file content
-                old_content = ""
-                if isfile(path)
-                    try
-                        old_content = read(path, String)
-                    catch
-                        old_content = ""
-                    end
-                end
-                
-                # Generate inline summary
-                old_lines = isempty(old_content) ? 0 : countlines(IOBuffer(old_content))
-                new_lines = isempty(new_content) ? 0 : countlines(IOBuffer(new_content))
-                
-                if isempty(old_content)
-                    change_summary = "(new file: $new_lines lines)"
-                else
-                    diff_lines = new_lines - old_lines
-                    if diff_lines > 0
-                        change_summary = "(+$(diff_lines) lines)"
-                    elseif diff_lines < 0
-                        change_summary = "($diff_lines lines)"
-                    else
-                        change_summary = "(modified)"
-                    end
-                end
-                
-                tool_request_msg = """🔧 Write: $path $change_summary
-   
-   Press 'y' to allow | 'n' to deny | 'r' to remember | F7:diff"""
-                
-                prov = provider(agent)
-                sys_msg = create_message(prov, "system", tool_request_msg)
-                add_message!(context(agent), sys_msg)
-            else
-                prov = provider(agent)
-                cmd_str = !isempty(args) ? join(["$k=$v" for (k, v) in args], " ") : ""
-                tool_request_msg = """🔧 Tool Request: $tool_name $cmd_str
-
-   Press 'y' to allow | 'n' to deny | 'r' to remember"""
-                
-                sys_msg = create_message(prov, "system", tool_request_msg)
-                add_message!(context(agent), sys_msg)
-            end
-            
-            # Add to pending queue (for both write and non-write tools)
+            # Initialize permission store if needed
             store = get_permission_store(m.current_session)
             if store === nothing
                 store = initialize_permission_store!(m.current_session)
@@ -3283,15 +3228,99 @@ function _process_tool_calls_inline!(m::TuiModel, agent::Agent, response)::Bool
             push!(m.pending_tool_calls, (Symbol(tool_name), args, state))
         end
         
-        # Set waiting state for first tool
+        # Show only the FIRST tool request
         if !isempty(m.pending_tool_calls)
-            m.waiting_for_tool_permission = true
-            m.current_tool_call = m.pending_tool_calls[1]
-            _set_status!(m, "Tool requests added - press 'y' to allow, 'n' to deny")
+            _show_next_tool_request!(m, agent)
             return false  # Waiting for user
         end
     end
     return true
+end
+
+"""
+    _show_next_tool_request!(m::TuiModel, agent::Agent)
+
+Show the next pending tool request inline. Called after each approval/denial.
+"""
+function _show_next_tool_request!(m::TuiModel, agent::Agent)
+    isempty(m.pending_tool_calls) && return
+    
+    tc = m.pending_tool_calls[1]  # First in queue
+    tool_name, args, state = tc
+    
+    # Format args for display
+    args_str = ""
+    if !isempty(args)
+        parts = String[]
+        for (k, v) in args
+            v_str = string(v)
+            if length(v_str) > 50
+                v_str = v_str[1:47] * "..."
+            end
+            push!(parts, "$k=$v_str")
+        end
+        args_str = join(parts, ", ")
+    else
+        args_str = "no arguments"
+    end
+    
+    # Show tool-specific message
+    if string(tool_name) in ["write", "edit"] && haskey(args, "path")
+        path = args["path"]
+        new_content = get(args, "content", "")
+        
+        # Read existing file content
+        old_content = ""
+        if isfile(path)
+            try
+                old_content = read(path, String)
+            catch
+                old_content = ""
+            end
+        end
+        
+        # Generate inline summary
+        old_lines = isempty(old_content) ? 0 : countlines(IOBuffer(old_content))
+        new_lines = isempty(new_content) ? 0 : countlines(IOBuffer(new_content))
+        
+        if isempty(old_content)
+            change_summary = "(new file: $new_lines lines)"
+        else
+            diff_lines = new_lines - old_lines
+            if diff_lines > 0
+                change_summary = "(+$(diff_lines) lines)"
+            elseif diff_lines < 0
+                change_summary = "($diff_lines lines)"
+            else
+                change_summary = "(modified)"
+            end
+        end
+        
+        tool_request_msg = """🔧 Write: $path $change_summary
+   
+   Press 'y' to allow | 'n' to deny | 'r' to remember | F7:diff"""
+        
+        prov = provider(agent)
+        sys_msg = create_message(prov, "system", tool_request_msg)
+        add_message!(context(agent), sys_msg)
+    else
+        cmd_str = !isempty(args) ? join(["$k=$v" for (k, v) in args], " ") : ""
+        tool_request_msg = """🔧 Tool Request: $(string(tool_name)) $cmd_str
+
+   Press 'y' to allow | 'n' to deny | 'r' to remember"""
+        
+        prov = provider(agent)
+        sys_msg = create_message(prov, "system", tool_request_msg)
+        add_message!(context(agent), sys_msg)
+    end
+    
+    # Debug log
+        _debug_log("Showing tool request: $(string(tool_name)), pending queue: $(length(m.pending_tool_calls))")
+        
+        # Set waiting state
+        m.waiting_for_tool_permission = true
+        m.current_tool_call = tc
+        _set_status!(m, "🔧 TOOL REQUEST: $(string(tool_name)) | Queue: $(length(m.pending_tool_calls)) | Press y:allow n:deny")
 end
 
 """
@@ -3309,9 +3338,10 @@ function _approve_tool_inline!(m::TuiModel; remember::Bool=false)
     
     # Check if request exists
     if state.request === nothing
-        # No request was created - execute directly (blocking)
+        # No request was created - execute directly
         popfirst!(m.pending_tool_calls)
         
+        # Execute async - when done and result visible, show next tool
         task = @async begin
             try
                 result = execute_tool(string(tool_name), args)
@@ -3322,25 +3352,33 @@ $output"""
                 tool_msg = create_message(provider(agent), "tool", tool_content)
                 add_message!(context(agent), tool_msg)
                 _set_status!(m, "✓ Executed: $tool_name")
+                
+                # After showing result, show next tool or continue
+                if !isempty(m.pending_tool_calls)
+                    _show_next_tool_request!(m, agent)
+                else
+                    empty!(m.tool_tasks)
+                    m.waiting_for_tool_permission = false
+                    m.current_tool_call = nothing
+                    _continue_after_tools_inline!(m, agent)
+                end
             catch e
                 _set_status!(m, "✗ Error: $e")
+                # Still show next tool even on error
+                if !isempty(m.pending_tool_calls)
+                    _show_next_tool_request!(m, agent)
+                else
+                    empty!(m.tool_tasks)
+                    m.waiting_for_tool_permission = false
+                    m.current_tool_call = nothing
+                end
             end
         end
         
-        # Move to next tool or wait and continue chat
-        if !isempty(m.pending_tool_calls)
-            m.current_tool_call = m.pending_tool_calls[1]
-            tc = m.current_tool_call
-            next_tool_name = tc[1]
-            _set_status!(m, "Next tool: $next_tool_name - press 'y' to allow, 'n' to deny")
-            # Don't wait - let user approve next tool while this one executes
-        else
-            # Last tool - wait for completion then continue chat
-            wait(task)
-            m.waiting_for_tool_permission = false
-            m.current_tool_call = nothing
-            _continue_after_tools_inline!(m, agent)
-        end
+        # Track task for spinner
+        push!(m.tool_tasks, task)
+        
+        # DON'T show next tool immediately - wait for result
         return
     end
     
@@ -3350,8 +3388,8 @@ $output"""
     # Remove from queue
     popfirst!(m.pending_tool_calls)
     
-    # Execute the tool
-    task = @async begin
+    # Execute async - when result visible, show next tool
+    @async begin
         try
             result = execute_with_permission(m.current_session, response)
             
@@ -3370,21 +3408,20 @@ $output"""
         catch e
             _set_status!(m, "✗ Error: $e")
         end
+        
+        # After showing result, show next tool or continue
+        if !isempty(m.pending_tool_calls)
+            _show_next_tool_request!(m, agent)
+        else
+            # All tools done, continue chat
+            empty!(m.tool_tasks)
+            m.waiting_for_tool_permission = false
+            m.current_tool_call = nothing
+            _continue_after_tools_inline!(m, agent)
+        end
     end
     
-    # After starting async execution, check if there are more tools waiting
-    if !isempty(m.pending_tool_calls)
-        m.current_tool_call = m.pending_tool_calls[1]
-        tc = m.current_tool_call
-        next_tool_name = tc[1]
-        _set_status!(m, "Next tool: $next_tool_name - press 'y' to allow, 'n' to deny")
-    else
-        # Last tool - wait for completion then continue chat
-        wait(task)
-        m.waiting_for_tool_permission = false
-        m.current_tool_call = nothing
-        _continue_after_tools_inline!(m, agent)
-    end
+    # DON'T show next tool immediately - wait for result to be visible
 end
 
 """
@@ -3411,7 +3448,7 @@ function _deny_tool_inline!(m::TuiModel)
         
         # Move to next or end
         if !isempty(m.pending_tool_calls)
-            m.current_tool_call = m.pending_tool_calls[1]
+            _show_next_tool_request!(m, agent)  # Show next tool request
         else
             m.waiting_for_tool_permission = false
             m.current_tool_call = nothing
@@ -3434,10 +3471,7 @@ function _deny_tool_inline!(m::TuiModel)
     
     # Move to next tool or continue
     if !isempty(m.pending_tool_calls)
-        m.current_tool_call = m.pending_tool_calls[1]
-        tc = m.current_tool_call
-        tool_name = tc[1]
-        _set_status!(m, "Next tool: $tool_name - press 'y' to allow, 'n' to deny")
+        _show_next_tool_request!(m, agent)  # Show next tool request
     else
         m.waiting_for_tool_permission = false
         m.current_tool_call = nothing
@@ -3449,18 +3483,53 @@ end
     _continue_after_tools_inline!(m::TuiModel, agent::Agent)
 
 Continue chat after all tools have been processed.
+Tool results are already in the context.
 """
 function _continue_after_tools_inline!(m::TuiModel, agent::Agent)
     @async begin
         try
-            response = FlootyAgents._do_chat(agent, false, false)
+            _set_status!(m, "Tool(s) complete - Getting LLM response...")
+            _debug_log("_continue_after_tools_inline! starting")
+            
+            # Log message count before chat
+            msgs_before = length(get_messages(context(agent)))
+            _debug_log("Messages in context before chat: $msgs_before")
+            
+            # Use public API to continue chat with tool results
+            # Tool results are already in context, send empty message to get LLM response
+            # stream=false for non-streaming response, auto_tools=false (we handle tools)
+            _debug_log("Calling chat with empty message to continue after tools...")
+            response = chat(agent, ""; stream=false, auto_tools=false)
+            _debug_log("chat returned: $(typeof(response))")
+            
             if response isa AbstractFlootyError
                 _set_status!(m, "Chat error: $(response.message)")
+                _debug_log("Chat error: $(response.message)")
                 return
             end
-            # Don't auto-process more tools - let user see response first
+            
+            # Log message count after chat
+            msgs_after = length(get_messages(context(agent)))
+            _debug_log("Messages in context after chat: $msgs_after")
+            
+            # Check if response has more tool calls
+            if hasproperty(response, :message) && response.message !== nothing
+                tcs = tool_calls(response.message)
+                _debug_log("Response has tool_calls: $(tcs !== nothing && !isempty(tcs))")
+                if tcs !== nothing && !isempty(tcs)
+                    # More tools - process them
+                    _process_tool_calls_inline!(m, agent, response)
+                else
+                    _set_status!(m, "Response complete")
+                end
+            else
+                _set_status!(m, "Response complete - no message in response")
+                _debug_log("No message in response")
+            end
         catch e
-            _set_status!(m, "Error continuing chat: $e")
+            _set_status!(m, "Error continuing chat: $(e)")
+            _debug_log("Exception in _continue_after_tools_inline!: $e")
+            rethrow(e)  # Re-throw to see full stack trace
         end
     end
 end
