@@ -785,9 +785,11 @@ end
     diff_view_new::String = ""      # New file content
     diff_view_path::String = ""     # File path being edited
     diff_view_tool_call::Any = nothing  # Tool call to execute if confirmed
+    diff_view_split::Bool = false   # GitHub-style split view (true) vs unified (false)
 
     # Tool Permission System
     pending_tool_calls::Vector{Tuple{Symbol, Dict{String,Any}, ToolExecutionState}} = []
+    executing_tool_calls::Set{Symbol} = Set{Symbol}()  # Track which tools are currently executing
     tool_permission_remember::Bool = false
     waiting_for_tool_permission::Bool = false  # NEW: Waiting for user y/n/r
     current_tool_call::Any = nothing  # NEW: Current tool being approved/denied
@@ -991,6 +993,18 @@ function _handle_key!(m::TuiModel, evt::KeyEvent)
             m.tool_permission_remember = !m.tool_permission_remember
             _set_status!(m, m.tool_permission_remember ? "Will remember choice" : "Won't remember choice")
             return
+        elseif evt.key == :f7
+            # Show diff view when waiting for write tool permission
+            if m.waiting_for_tool_permission && m.current_tool_call !== nothing
+                tool_name, args, state = m.current_tool_call
+                if haskey(args, "path")
+                    path = args["path"]
+                    new_content = get(args, "content", "")
+                    old_content = isfile(path) ? read(path, String) : ""
+                    show_diff_view!(m, path, old_content, new_content, nothing)
+                    return
+                end
+            end
         end
     end
 
@@ -3038,8 +3052,15 @@ function _execute_diff_tool_call!(m::TuiModel)
 
     # Execute the tool
     tc = m.diff_view_tool_call
-    tool_name_str = call_name(tc)
-    args = call_arguments(tc)
+    
+    # If no tool call stored (from F7 inline), use current_tool_call
+    if tc === nothing && m.current_tool_call !== nothing
+        tool_name, args, state = m.current_tool_call
+        tool_name_str = string(tool_name)
+    else
+        tool_name_str = call_name(tc)
+        args = call_arguments(tc)
+    end
 
     _set_status!(m, "Executing $tool_name_str...")
 
@@ -3192,17 +3213,57 @@ function _process_tool_calls_inline!(m::TuiModel, agent::Agent, response)::Bool
                 args_str = "no arguments"
             end
             
-            # Create system message showing permission request
-            prov = provider(agent)
-            cmd_str = !isempty(args) ? join(["$k=$v" for (k, v) in args], " ") : ""
-            tool_request_msg = """🔧 Tool Request: $tool_name $cmd_str
+            # Check if this is a write/edit tool - show inline summary
+            if tool_name in ["write", "edit"] && haskey(args, "path")
+                path = args["path"]
+                new_content = get(args, "content", "")
+                
+                # Read existing file content
+                old_content = ""
+                if isfile(path)
+                    try
+                        old_content = read(path, String)
+                    catch
+                        old_content = ""
+                    end
+                end
+                
+                # Generate inline summary
+                old_lines = isempty(old_content) ? 0 : countlines(IOBuffer(old_content))
+                new_lines = isempty(new_content) ? 0 : countlines(IOBuffer(new_content))
+                
+                if isempty(old_content)
+                    change_summary = "(new file: $new_lines lines)"
+                else
+                    diff_lines = new_lines - old_lines
+                    if diff_lines > 0
+                        change_summary = "(+$(diff_lines) lines)"
+                    elseif diff_lines < 0
+                        change_summary = "($diff_lines lines)"
+                    else
+                        change_summary = "(modified)"
+                    end
+                end
+                
+                tool_request_msg = """🔧 Write: $path $change_summary
+   
+   Press 'y' to allow | 'n' to deny | 'r' to remember | F7:diff"""
+                
+                prov = provider(agent)
+                sys_msg = create_message(prov, "system", tool_request_msg)
+                add_message!(context(agent), sys_msg)
+            else
+                prov = provider(agent)
+                cmd_str = !isempty(args) ? join(["$k=$v" for (k, v) in args], " ") : ""
+                tool_request_msg = """🔧 Tool Request: $tool_name $cmd_str
 
    Press 'y' to allow | 'n' to deny | 'r' to remember"""
+                
+                sys_msg = create_message(prov, "system", tool_request_msg)
+                add_message!(context(agent), sys_msg)
+            end
             
-            sys_msg = create_message(prov, "system", tool_request_msg)
-            add_message!(context(agent), sys_msg)
-            
-            # Add to pending queue
+            # Add to pending queue (for both write and non-write tools)
             store = get_permission_store(m.current_session)
             if store === nothing
                 store = initialize_permission_store!(m.current_session)
@@ -3248,9 +3309,10 @@ function _approve_tool_inline!(m::TuiModel; remember::Bool=false)
     
     # Check if request exists
     if state.request === nothing
-        # No request was created - execute directly
+        # No request was created - execute directly (blocking)
         popfirst!(m.pending_tool_calls)
-        @async begin
+        
+        task = @async begin
             try
                 result = execute_tool(string(tool_name), args)
                 args_str = join(["$k=$v" for (k, v) in args], " ")
@@ -3264,6 +3326,21 @@ $output"""
                 _set_status!(m, "✗ Error: $e")
             end
         end
+        
+        # Move to next tool or wait and continue chat
+        if !isempty(m.pending_tool_calls)
+            m.current_tool_call = m.pending_tool_calls[1]
+            tc = m.current_tool_call
+            next_tool_name = tc[1]
+            _set_status!(m, "Next tool: $next_tool_name - press 'y' to allow, 'n' to deny")
+            # Don't wait - let user approve next tool while this one executes
+        else
+            # Last tool - wait for completion then continue chat
+            wait(task)
+            m.waiting_for_tool_permission = false
+            m.current_tool_call = nothing
+            _continue_after_tools_inline!(m, agent)
+        end
         return
     end
     
@@ -3274,7 +3351,7 @@ $output"""
     popfirst!(m.pending_tool_calls)
     
     # Execute the tool
-    @async begin
+    task = @async begin
         try
             result = execute_with_permission(m.current_session, response)
             
@@ -3290,24 +3367,23 @@ $output"""
             else
                 _set_status!(m, "✗ Failed: $(result.error)")
             end
-            
-            # Move to next tool or continue chat
-            if !isempty(m.pending_tool_calls)
-                m.current_tool_call = m.pending_tool_calls[1]
-                tc = m.current_tool_call
-                tool_name = tc[1]
-                _set_status!(m, "Next tool: $tool_name - press 'y' to allow, 'n' to deny")
-            else
-                # All tools done, continue chat
-                m.waiting_for_tool_permission = false
-                m.current_tool_call = nothing
-                _continue_after_tools_inline!(m, agent)
-            end
         catch e
             _set_status!(m, "✗ Error: $e")
-            m.waiting_for_tool_permission = false
-            m.current_tool_call = nothing
         end
+    end
+    
+    # After starting async execution, check if there are more tools waiting
+    if !isempty(m.pending_tool_calls)
+        m.current_tool_call = m.pending_tool_calls[1]
+        tc = m.current_tool_call
+        next_tool_name = tc[1]
+        _set_status!(m, "Next tool: $next_tool_name - press 'y' to allow, 'n' to deny")
+    else
+        # Last tool - wait for completion then continue chat
+        wait(task)
+        m.waiting_for_tool_permission = false
+        m.current_tool_call = nothing
+        _continue_after_tools_inline!(m, agent)
     end
 end
 
