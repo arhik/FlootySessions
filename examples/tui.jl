@@ -3308,11 +3308,14 @@ Returns true if permission is granted or requested, false if waiting for user.
 """
 function _prepare_tool_execution!(m::TuiModel, tool_name::Symbol, args::Dict{String,Any})::Bool
     session = m.current_session
-    session === nothing && return false
+    session === nothing && (_debug_log("No session"); return false)
+    
+    _debug_log("_prepare_tool_execution: $tool_name")
     
     # Ensure permission store exists
     store = get_permission_store(session)
     if store === nothing
+        _debug_log("Creating permission store")
         store = initialize_permission_store!(session)
         set_permission_mode!(session, "auto_grant_safe")
     end
@@ -3332,7 +3335,9 @@ function _prepare_tool_execution!(m::TuiModel, tool_name::Symbol, args::Dict{Str
     
     if state.request !== nothing && state.response === nothing
         # Need user permission - add to pending queue
+        _debug_log("Tool $tool_name needs permission, queue size before: $(length(m.pending_tool_calls))")
         push!(m.pending_tool_calls, (tool_name, args, state))
+        _debug_log("Queue size after: $(length(m.pending_tool_calls))")
         _set_status!(m, "Tool '$tool_name' requires permission")
         return false  # Waiting for user response
     elseif state.executed && state.response !== nothing
@@ -3438,11 +3443,13 @@ Check if there are pending tool calls that need user attention.
 Call this during the update loop to show the permission modal.
 """
 function _check_pending_tools!(m::TuiModel)
+    _debug_log("_check_pending_tools: pending=$(length(m.pending_tool_calls)), modal=$(m.modal)")
     # Only check if not currently in another modal
-    isempty(m.pending_tool_calls) && return
-    m.modal != MODAL_NONE && return
+    isempty(m.pending_tool_calls) && (_debug_log("No pending tools"); return)
+    m.modal != MODAL_NONE && (_debug_log("Modal already open: $(m.modal)"); return)
     
     # Show the permission modal
+    _debug_log("SHOWING PERMISSION MODAL")
     m.modal = MODAL_TOOL_PERMISSION
     m.modal_selected = :cancel  # Default to cancel for safety
     m.tool_permission_remember = false
@@ -3503,16 +3510,19 @@ Returns true if processing should continue (tools executed or no tools),
 false if waiting for user permission.
 """
 function _process_tool_calls_with_permission!(m::TuiModel, agent::Agent, response)::Bool
+    _debug_log("_process_tool_calls_with_permission! starting")
     # Note: The response message is ALREADY added to context by _do_chat in FlootyAgents
     # We just need to check for tool calls and handle them
     if hasproperty(response, :message) && response.message !== nothing
         msg = response.message
         tcs = tool_calls(msg)
         has_tool_calls = tcs !== nothing && !isempty(tcs)
+        _debug_log("Has tool calls: $has_tool_calls")
         
         # If no tool calls, we're done
         !has_tool_calls && return true
     else
+        _debug_log("No message in response")
         return true  # No message, nothing to do
     end
     
@@ -3583,6 +3593,7 @@ $output"""
     
     # If any tools are pending permission, show the modal
     if any_pending
+        _debug_log("Calling _check_pending_tools! with $(length(m.pending_tool_calls)) pending")
         _check_pending_tools!(m)
         return false  # Waiting for user
     end
