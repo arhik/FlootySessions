@@ -2,7 +2,7 @@
 # FlootySessions TUI - Session-based Chat Interface with Persistence
 #
 # Keys:
-#   Ctrl+C           - Quit (auto-saves sessions)
+#   Ctrl+C or F10    - Quit (auto-saves sessions)
 #   F2               - Toggle session sidebar
 #   F3               - New session modal
 #   F4               - Delete current session (with confirmation)
@@ -778,6 +778,10 @@ end
     diff_view_path::String = ""     # File path being edited
     diff_view_tool_call::Any = nothing  # Tool call to execute if confirmed
 
+    # Tool Permission System
+    pending_tool_calls::Vector{Tuple{Symbol, Dict{String,Any}, ToolExecutionState}} = []
+    tool_permission_remember::Bool = false
+
     # Model selection
     available_models::Vector{String} = [
         "nemotron-3-nano:30b-cloud",
@@ -965,8 +969,8 @@ function _handle_key!(m::TuiModel, evt::KeyEvent)
     end
 
     # Global shortcuts
-    # Ctrl+C to quit (only way to exit)
-    if evt.key == :char && evt.char == '\x03'
+    # Ctrl+C or F10 to quit
+    if evt.key == :char && evt.char == '\x03' || evt.key == :f10
         _auto_save!(m)  # Save before quit
         m.quit = true
         return
@@ -1287,6 +1291,24 @@ function _handle_modal_key!(m::TuiModel, evt::KeyEvent)
     elseif m.modal == MODAL_SYSTEM_PROMPT
         if evt.key == :escape || evt.key == :char && evt.char == 'q'
             m.modal = MODAL_NONE
+        end
+    elseif m.modal == MODAL_TOOL_PERMISSION
+        # Tab toggles between Confirm(Allow) and Cancel(Deny)
+        if evt.key == :tab
+            m.modal_selected = m.modal_selected == :confirm ? :cancel : :confirm
+        # Space toggles remember checkbox
+        elseif evt.key == :char && evt.char == ' '
+            m.tool_permission_remember = !m.tool_permission_remember
+        elseif evt.key == :left
+            m.modal_selected = :cancel
+        elseif evt.key == :right
+            m.modal_selected = :confirm
+        elseif evt.key == :enter
+            _handle_tool_permission_response!(m)
+        elseif evt.key == :escape
+            # Escape denies the tool
+            m.modal_selected = :cancel
+            _handle_tool_permission_response!(m)
         end
     end
 end
@@ -1913,7 +1935,7 @@ function _send_message!(m::TuiModel)
                 msg_count_before = length(get_messages(agent.context))
 
                 _debug_log("Sending to chat (no attachments): text length=$(length(text))")
-                result = chat(agent, text; stream=false, auto_tools=true)
+                result = chat(agent, text; stream=false, auto_tools=false)
                 _debug_log("Chat response received: $(typeof(result))")
                 if result isa AbstractMessage || (hasproperty(result, :message) && result.message !== nothing)
                     resp_content = content(result.message)
@@ -1930,6 +1952,11 @@ function _send_message!(m::TuiModel)
                             ctx_msg.metadata["model"] = current_model
                         end
                     end
+                end
+
+                # Process tool calls with permission system
+                if !(result isa AbstractFlootyError)
+                    _process_tool_calls_silent!(m, agent, result)
                 end
 
                 put!(result_channel, result)
@@ -1960,7 +1987,7 @@ function _send_message!(m::TuiModel)
                 msg_count_before = length(get_messages(agent.context))
 
                 _debug_log("Sending to chat (with attachments): text length=$(length(text)), attachments=$(length(attachments))")
-                result = chat(agent, text, attachments; stream=false, auto_tools=true)
+                result = chat(agent, text, attachments; stream=false, auto_tools=false)
                 _debug_log("Chat response received: $(typeof(result))")
                 if result isa AbstractMessage || (hasproperty(result, :message) && result.message !== nothing)
                     resp_content = content(result.message)
@@ -1979,6 +2006,11 @@ function _send_message!(m::TuiModel)
                             ctx_msg.metadata["attachment_mimes"] = mimes
                         end
                     end
+                end
+
+                # Process tool calls with permission system
+                if !(result isa AbstractFlootyError)
+                    _process_tool_calls_silent!(m, agent, result)
                 end
 
                 put!(result_channel, result)
@@ -2067,7 +2099,7 @@ function _trigger_llm_response!(m::TuiModel, edited_text::String, attachments::V
                 msg_count_before = length(get_messages(agent.context))
 
                 # Send the edited message text to get LLM response
-                result = chat(agent, edited_text; stream=false, auto_tools=true)
+                result = chat(agent, edited_text; stream=false, auto_tools=false)
 
                 # Update the user message metadata with the model used
                 # The user message should be at msg_count_before + 1
@@ -2079,6 +2111,12 @@ function _trigger_llm_response!(m::TuiModel, edited_text::String, attachments::V
                             ctx_msg.metadata["model"] = current_model
                         end
                     end
+                end
+
+
+                # Process tool calls with permission system
+                if !(result isa AbstractFlootyError)
+                    _process_tool_calls_silent!(m, agent, result)
                 end
 
                 put!(result_channel, result)
@@ -2101,7 +2139,7 @@ function _trigger_llm_response!(m::TuiModel, edited_text::String, attachments::V
                 msg_count_before = length(get_messages(agent.context))
 
                 # Send with attachments
-                result = chat(agent, edited_text, att_objs; stream=false, auto_tools=true)
+                result = chat(agent, edited_text, att_objs; stream=false, auto_tools=false)
 
                 # Update metadata with model and attachment info
                 # The user message should be at msg_count_before + 1
@@ -2115,6 +2153,12 @@ function _trigger_llm_response!(m::TuiModel, edited_text::String, attachments::V
                             ctx_msg.metadata["attachment_mimes"] = mimes
                         end
                     end
+                end
+
+
+                # Process tool calls with permission system
+                if !(result isa AbstractFlootyError)
+                    _process_tool_calls_silent!(m, agent, result)
                 end
 
                 put!(result_channel, result)
@@ -2274,7 +2318,7 @@ function _build_status(m::TuiModel)::String
 
         m.streaming_session_id !== nothing && push!(parts, "⏳ streaming (Esc:stop)")
 
-        push!(parts, "F2:sidebar F3:new F4:del F5:save F6:model F7:msg F8:rules q:queue @:attach Ctrl+C:quit")
+        push!(parts, "F2:sidebar F3:new F4:del F5:save F6:model F7:msg F8:rules q:queue @:attach F10:quit")
     end
 
     join(parts, " | ")
@@ -2826,6 +2870,8 @@ function _render_modal!(m::TuiModel, buf::Buffer, area::Rect)
         _render_diff_view_modal!(m, buf, area)
     elseif m.modal == MODAL_SYSTEM_PROMPT
         _render_system_prompt_modal!(m, buf, area)
+    elseif m.modal == MODAL_TOOL_PERMISSION
+        _render_tool_permission_modal!(m, buf, area)
     end
 end
 
@@ -3117,6 +3163,109 @@ function show_system_prompt()
     end
 end
 
+
+"""
+    _render_tool_permission_modal!(m::TuiModel, buf::Buffer, area::Rect)
+
+Render the tool permission request modal.
+"""
+function _render_tool_permission_modal!(m::TuiModel, buf::Buffer, area::Rect)
+    isempty(m.pending_tool_calls) && return
+    
+    # Get the first pending tool call
+    tool_name, args, state = m.pending_tool_calls[1]
+    
+    # Title
+    title = " 🔧 Tool Permission Request "
+    title_style = Style(fg=ColorRGB(255, 200, 100), bold=true)
+    
+    # Calculate modal dimensions
+    modal_width = min(80, area.width - 6)
+    modal_height = 18
+    modal_rect = center(area, modal_width, modal_height)
+    
+    # Border - highlight based on selection
+    border_style = Style(fg=Color256(245))
+    if m.modal_selected == :confirm
+        border_style = Style(fg=ColorRGB(100, 255, 100), bold=true)
+    elseif m.modal_selected == :cancel
+        border_style = Style(fg=ColorRGB(255, 100, 100), bold=true)
+    end
+    
+    block = Block(
+        title=title,
+        border_style=border_style,
+        title_style=title_style,
+        box=BOX_HEAVY,
+    )
+    content_rect = render(block, modal_rect, buf)
+    
+    # Tool name header
+    y = content_rect.y
+    header = "Tool: $tool_name"
+    set_string!(buf, content_rect.x + 2, y, header, Style(fg=ColorRGB(100, 255, 100), bold=true))
+    y += 2
+    
+    # Arguments preview
+    set_string!(buf, content_rect.x + 2, y, "Arguments:", Style(fg=ColorRGB(200, 200, 200), bold=true))
+    y += 1
+    
+    # Format arguments
+    args_preview = ""
+    if !isempty(args)
+        parts = String[]
+        for (k, v) in args
+            v_str = string(v)
+            if length(v_str) > 30
+                v_str = v_str[1:27] * "..."
+            end
+            push!(parts, "$k: $v_str")
+        end
+        args_preview = join(parts, ", ")
+    else
+        args_preview = "No arguments"
+    end
+    
+    max_preview_width = content_rect.width - 4
+    if length(args_preview) > max_preview_width
+        args_preview = args_preview[1:max_preview_width-3] * "..."
+    end
+    set_string!(buf, content_rect.x + 4, y, args_preview, Style(fg=ColorRGB(255, 255, 255)))
+    y += 2
+    
+    # Warning text
+    warning_text = "⚠️  Allow this tool to execute?"
+    set_string!(buf, content_rect.x + 2, y, warning_text, Style(fg=ColorRGB(255, 200, 100)))
+    y += 2
+    
+    # Remember choice checkbox
+    remember_text = m.tool_permission_remember ? "[✓] Remember choice for this session" : "[ ] Remember choice for this session"
+    remember_style = m.tool_permission_remember ? Style(fg=ColorRGB(100, 255, 100)) : Style(fg=Color256(245))
+    set_string!(buf, content_rect.x + 2, y, remember_text, remember_style)
+    y += 3
+    
+    # Buttons
+    button_y = y
+    allow_x = content_rect.x + div(content_rect.width, 3) - 3
+    deny_x = content_rect.x + div(2 * content_rect.width, 3) - 3
+    
+    allow_style = m.modal_selected == :confirm ? 
+        Style(fg=ColorRGB(0, 0, 0), bg=ColorRGB(100, 255, 100), bold=true) :
+        Style(fg=ColorRGB(100, 255, 100))
+    deny_style = m.modal_selected == :cancel ? 
+        Style(fg=ColorRGB(0, 0, 0), bg=ColorRGB(255, 100, 100), bold=true) :
+        Style(fg=ColorRGB(255, 100, 100))
+    
+    set_string!(buf, allow_x, button_y, "  Allow  ", allow_style)
+    set_string!(buf, deny_x, button_y, "  Deny  ", deny_style)
+    
+    # Help text
+    help_y = bottom(content_rect) - 1
+    help_text = "Tab:toggle | Space:remember | Enter:confirm"
+    help_x = content_rect.x + div(content_rect.width - length(help_text), 2)
+    set_string!(buf, help_x, help_y, help_text, Style(fg=Color256(245)))
+end
+
 # ═══════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════
@@ -3151,3 +3300,293 @@ function flooty_sessions_tui(; show_prompt::Bool=false)
 
     app(model; fps=30)
 end
+"""
+    _prepare_tool_execution!(m::TuiModel, tool_name::Symbol, args::Dict{String,Any}) -> Bool
+
+Prepare a tool execution with permission checking.
+Returns true if permission is granted or requested, false if waiting for user.
+"""
+function _prepare_tool_execution!(m::TuiModel, tool_name::Symbol, args::Dict{String,Any})::Bool
+    session = m.current_session
+    session === nothing && return false
+    
+    # Ensure permission store exists
+    store = get_permission_store(session)
+    if store === nothing
+        store = initialize_permission_store!(session)
+        set_permission_mode!(session, "auto_grant_safe")
+    end
+    
+    # Get tool description
+    tool_desc = ""
+    for tool in session.tools
+        if tool.name == string(tool_name)
+            tool_desc = tool.description
+            break
+        end
+    end
+    isempty(tool_desc) && (tool_desc = "Execute $tool_name")
+    
+    # Prepare execution
+    state = prepare_tool_execution(session, string(tool_name), tool_desc, args)
+    
+    if state.request !== nothing && state.response === nothing
+        # Need user permission - add to pending queue
+        push!(m.pending_tool_calls, (tool_name, args, state))
+        _set_status!(m, "Tool '$tool_name' requires permission")
+        return false  # Waiting for user response
+    elseif state.executed && state.response !== nothing
+        # Auto-granted (previously remembered)
+        return true  # Can execute immediately
+    else
+        # Denied
+        _set_status!(m, "Tool '$tool_name' execution denied")
+        return false
+    end
+end
+
+"""
+    _handle_tool_permission_response!(m::TuiModel)
+
+Handle user's response to a tool permission request.
+"""
+function _handle_tool_permission_response!(m::TuiModel)
+    isempty(m.pending_tool_calls) && (m.modal = MODAL_NONE; return)
+    
+    session = m.current_session
+    session === nothing && (m.modal = MODAL_NONE; return)
+    
+    # Get the first pending tool call
+    tool_name, args, state = m.pending_tool_calls[1]
+    
+    approved = m.modal_selected == :confirm
+    remember = m.tool_permission_remember
+    
+    # Submit the response
+    new_state = submit_permission_response(
+        session,
+        state.request,
+        approved;
+        remember_choice=remember
+    )
+    
+    # Remove from pending queue
+    popfirst!(m.pending_tool_calls)
+    
+    # Clear modal state
+    m.modal = MODAL_NONE
+    m.modal_selected = :cancel
+    m.tool_permission_remember = false
+    
+    if approved
+        _set_status!(m, "✓ Tool '$tool_name' approved")
+        
+        # Execute the tool
+        @async begin
+            try
+                result = execute_with_permission(session, new_state)
+                
+                if result.success
+                    _set_status!(m, "✓ Executed: $tool_name")
+                    
+                    # Format and add tool result to context
+                    agent = get_active_agent(session)
+                    if agent !== nothing
+                        args_str = join(["$k=$v" for (k, v) in args], " ")
+                        output = result.success ? result.data : "Error: $(result.error)"
+                        tool_content = """\$ $tool_name $args_str
+$output"""
+                        tool_msg = create_message(provider(agent), "tool", tool_content)
+                        add_message!(context(agent), tool_msg)
+                    end
+                    
+                    # Continue chat after tool execution
+                    if isempty(m.pending_tool_calls)
+                        _continue_after_tools!(m, agent)
+                    end
+                else
+                    _set_status!(m, "✗ Failed: $(result.error)")
+                end
+            catch e
+                _set_status!(m, "✗ Error executing $tool_name: $e")
+            end
+        end
+    else
+        _set_status!(m, "✗ Tool '$tool_name' denied by user")
+        
+        # Add a system message noting the denial
+        agent = get_active_agent(session)
+        if agent !== nothing
+            prov = provider(agent)
+            add_message!(agent.context,
+                create_message(prov, "system", "Tool '$tool_name' was denied by user. Ask for alternative approach or explanation."))
+        end
+    end
+    
+    # If there are more pending tool calls, show the modal again
+    if !isempty(m.pending_tool_calls)
+        m.modal = MODAL_TOOL_PERMISSION
+        m.modal_selected = :cancel  # Default to deny for safety
+        _set_status!(m, "Another tool waiting for permission")
+    end
+end
+
+"""
+    _check_pending_tools!(m::TuiModel)
+
+Check if there are pending tool calls that need user attention.
+Call this during the update loop to show the permission modal.
+"""
+function _check_pending_tools!(m::TuiModel)
+    # Only check if not currently in another modal
+    isempty(m.pending_tool_calls) && return
+    m.modal != MODAL_NONE && return
+    
+    # Show the permission modal
+    m.modal = MODAL_TOOL_PERMISSION
+    m.modal_selected = :cancel  # Default to cancel for safety
+    m.tool_permission_remember = false
+end
+
+"""
+    _continue_after_tools!(m::TuiModel, agent::Agent)
+
+Continue the chat after tools have been executed.
+"""
+function _continue_after_tools!(m::TuiModel, agent::Agent)
+    @async begin
+        try
+            # Call _do_chat directly without adding a user message
+            response = FlootyAgents._do_chat(agent, false, false)
+            
+            if response isa AbstractFlootyError
+                _set_status!(m, "Chat error: $(response.message)")
+                return
+            end
+            
+            # Process any tool calls in the response
+            _process_tool_calls_silent!(m, agent, response)
+        catch e
+            _set_status!(m, "Error continuing chat: $e")
+        end
+    end
+end
+
+"""
+    _process_tool_calls_silent!(m::TuiModel, agent::Agent, response)
+
+Process tool calls without affecting the result_channel flow.
+Called from async blocks after chat completes.
+"""
+function _process_tool_calls_silent!(m::TuiModel, agent::Agent, response)
+    # Check for tool_calls synchronously first
+    if hasproperty(response, :message) && response.message !== nothing
+        tcs = tool_calls(response.message)
+        if tcs !== nothing && !isempty(tcs)
+            # Process in async to not block
+            @async begin
+                try
+                    _process_tool_calls_with_permission!(m, agent, response)
+                catch e
+                    _set_status!(m, "Error processing tools: $e")
+                end
+            end
+        end
+    end
+end
+
+"""
+    _process_tool_calls_with_permission!(m::TuiModel, agent::Agent, response) -> Bool
+
+Process tool calls from a chat response using the permission system.
+Returns true if processing should continue (tools executed or no tools),
+false if waiting for user permission.
+"""
+function _process_tool_calls_with_permission!(m::TuiModel, agent::Agent, response)::Bool
+    # Note: The response message is ALREADY added to context by _do_chat in FlootyAgents
+    # We just need to check for tool calls and handle them
+    if hasproperty(response, :message) && response.message !== nothing
+        msg = response.message
+        tcs = tool_calls(msg)
+        has_tool_calls = tcs !== nothing && !isempty(tcs)
+        
+        # If no tool calls, we're done
+        !has_tool_calls && return true
+    else
+        return true  # No message, nothing to do
+    end
+    
+    # Now process any tool calls
+    tcs = tool_calls(response.message)
+    (tcs === nothing || isempty(tcs)) && return true
+    
+    session = m.current_session
+    session === nothing && return true
+    
+    # Ensure permission store exists
+    store = get_permission_store(session)
+    if store === nothing
+        store = initialize_permission_store!(session)
+        set_permission_mode!(session, "auto_grant_safe")
+    end
+    
+    # Track pending vs immediately executed
+    any_pending = false
+    executed_tools = []
+    
+    for tc in tcs
+        tool_name = call_name(tc) |> Symbol
+        args = call_arguments(tc)
+        
+        if _prepare_tool_execution!(m, tool_name, args)
+            # Permission already granted - execute immediately
+            push!(executed_tools, tc)
+        else
+            any_pending = true
+        end
+    end
+    
+    # Execute immediately-approved tools
+    for tc in executed_tools
+        tool_name_str = call_name(tc)
+        tool_args = call_arguments(tc)
+        
+        @async begin
+            try
+                result = execute_tool(tool_name_str, tool_args)
+                
+                # Format tool content like a shell command
+                args_str = join(["$k=$v" for (k, v) in tool_args], " ")
+                output = result.success ? result.data : "Error: $(result.error)"
+                tool_content = """\$ $tool_name_str $args_str
+$output"""
+                
+                # Add tool result to context
+                tool_msg = create_message(provider(agent), "tool", tool_content)
+                add_message!(context(agent), tool_msg)
+                
+                if result.success
+                    _set_status!(m, "✓ Executed: $tool_name_str")
+                else
+                    _set_status!(m, "✗ Failed: $tool_name_str - $(result.error)")
+                end
+                
+                # Continue chat to get next response
+                if isempty(m.pending_tool_calls)
+                    _continue_after_tools!(m, agent)
+                end
+            catch e
+                _set_status!(m, "✗ Error: $e")
+            end
+        end
+    end
+    
+    # If any tools are pending permission, show the modal
+    if any_pending
+        _check_pending_tools!(m)
+        return false  # Waiting for user
+    end
+    
+    return true
+end
+
