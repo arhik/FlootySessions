@@ -209,8 +209,16 @@ function render_widget(buf::Buffer, widget::MessageWidget, x::Int, y::Int, max_y
     # Add attachment indicator if message has images
     msg_images = images(msg)
     if msg_images !== nothing && !isempty(msg_images)
+        # Count images, and also check for source paths
         img_count = length(msg_images)
-        push!(metadata_parts, img_count == 1 ? "📎 1 image" : "📎 $img_count images")
+        # Check if any images have source paths (for displaying filenames)
+        has_source_paths = any(img -> hasfield(typeof(img), :source_path) && img.source_path !== nothing, msg_images)
+        if has_source_paths
+            # Show as attachments with file info
+            push!(metadata_parts, img_count == 1 ? "📎 1 file" : "📎 $img_count files")
+        else
+            push!(metadata_parts, img_count == 1 ? "📎 1 image" : "📎 $img_count images")
+        end
     end
 
     # Add timestamp if available
@@ -1524,7 +1532,8 @@ function _handle_chat_click!(m::TuiModel, evt::MouseEvent, sidebar_width::Int)
         widget = MessageWidget(ctx_msg.message, agent.name, content_width;
                               timestamp=ctx_msg.timestamp,
                               model=agent.model,
-                              msg_agent_name=agent.name)
+                              msg_agent_name=agent.name,
+                              )
         msg_height = _calculate_widget_height(widget)
 
         # Calculate message position (same as in _render_chat!)
@@ -2469,7 +2478,8 @@ function _render_chat!(m::TuiModel, buf::Buffer, area::Rect)
         widget = MessageWidget(ctx_msg.message, agent.name, content_width;
                               timestamp=ctx_msg.timestamp,
                               model=msg_model,
-                              msg_agent_name=agent.name)
+                              msg_agent_name=agent.name,
+                              )
         total_height += _calculate_widget_height(widget) + 1  # +1 for spacing
         # Hash the message content to detect changes
         msg_content = content(ctx_msg.message)
@@ -2514,7 +2524,8 @@ function _render_chat!(m::TuiModel, buf::Buffer, area::Rect)
                               model=msg_model,
                               msg_agent_name=agent.name,
                               is_selected=is_selected,
-                              is_editing=is_editing)
+                              is_editing=is_editing,
+                              )
 
         # If editing, populate the edit buffer from model's edit_area
         if is_editing
