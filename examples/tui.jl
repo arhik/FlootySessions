@@ -23,7 +23,8 @@ using FlootySessions: Session, SessionManager, set_active_agent!, set_active_ses
 using FlootySessions: ToolExecutionState, prepare_tool_execution, submit_permission_response, execute_with_permission, initialize_permission_store!, get_permission_store, set_permission_mode!
 
 # Include diff view components directly (depends on Tachikoma)
-include(joinpath(@__DIR__, "..", "src", "diff_view.jl"))
+# Diff visualization component (used for inline diff view in modal)
+include(joinpath(@__DIR__, "diff_view.jl"))
 using .DiffView
 using FlootyAgents
 using FlootyAgents: Agent, create_agent, descendants, context
