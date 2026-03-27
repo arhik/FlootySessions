@@ -1318,7 +1318,6 @@ function _handle_modal_key!(m::TuiModel, evt::KeyEvent)
             m.modal = MODAL_NONE
         elseif evt.key == :char && evt.char == 'n' || evt.key == :escape
             _debug_log("Cancelling diff tool call")
-            _set_status!(m, "File edit cancelled")
             m.modal = MODAL_NONE
             # Clear diff view state
             m.diff_view_path = ""
@@ -1327,6 +1326,8 @@ function _handle_modal_key!(m::TuiModel, evt::KeyEvent)
             m.diff_view_tool_call = nothing
             m.diff_viewer = nothing
             _debug_log("Cleared diff view state on cancel")
+            # Properly deny the tool and continue chat
+            _deny_tool_inline!(m)
         elseif evt.key == :char && evt.char == 'j' || evt.key == :down
             if m.diff_viewer !== nothing
                 DiffView.move_cursor!(m.diff_viewer.state, 1)
