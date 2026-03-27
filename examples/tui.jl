@@ -1335,6 +1335,30 @@ function _handle_modal_key!(m::TuiModel, evt::KeyEvent)
             if m.diff_viewer !== nothing
                 DiffView.move_cursor!(m.diff_viewer.state, -1)
             end
+        elseif evt.key == :page_down
+            if m.diff_viewer !== nothing
+                DiffView.move_cursor!(m.diff_viewer.state, m.diff_viewer.state.height)
+            end
+        elseif evt.key == :page_up
+            if m.diff_viewer !== nothing
+                DiffView.move_cursor!(m.diff_viewer.state, -m.diff_viewer.state.height)
+            end
+        elseif evt.key == :home
+            if m.diff_viewer !== nothing
+                m.diff_viewer.state.scroll_offset = 0
+            end
+        elseif evt.key == :end
+            if m.diff_viewer !== nothing
+                # Calculate total lines
+                total_lines = 0
+                if !isempty(m.diff_viewer.state.files)
+                    file = m.diff_viewer.state.files[m.diff_viewer.state.current_file]
+                    for hunk in file.hunks
+                        total_lines += length(hunk.lines)
+                    end
+                end
+                m.diff_viewer.state.scroll_offset = max(0, total_lines - m.diff_viewer.state.height)
+            end
         elseif evt.key == :char && evt.char == '\t'
             if m.diff_viewer !== nothing
                 DiffView.toggle_view_mode!(m.diff_viewer.state)
@@ -1391,7 +1415,9 @@ function _handle_mouse!(m::TuiModel, evt::MouseEvent)
         end
     elseif evt.button == mouse_scroll_up && evt.action == mouse_press
         _debug_log("Scroll up")
-        if m.sidebar_focused
+        if m.modal == MODAL_DIFF_VIEW && m.diff_viewer !== nothing
+            DiffView.move_cursor!(m.diff_viewer.state, -3)
+        elseif m.sidebar_focused
             m.sidebar_scroll_offset = max(0, m.sidebar_scroll_offset - 3)
         elseif m.queue_select_mode && !isempty(m.message_queue)
             m.queue_scroll_offset = max(0, m.queue_scroll_offset - 1)
@@ -1400,7 +1426,9 @@ function _handle_mouse!(m::TuiModel, evt::MouseEvent)
         end
     elseif evt.button == mouse_scroll_down && evt.action == mouse_press
         _debug_log("Scroll down")
-        if m.sidebar_focused
+        if m.modal == MODAL_DIFF_VIEW && m.diff_viewer !== nothing
+            DiffView.move_cursor!(m.diff_viewer.state, 3)
+        elseif m.sidebar_focused
             sessions = list_sessions(m.manager)
             total_height = 0
             active_id = m.manager.active_session_id
@@ -3036,22 +3064,39 @@ function _render_diff_view_modal!(m::TuiModel, buf::Buffer, area::Rect)
     )
     content = render(block, modal_rect, buf)
 
+    # Reserve space for scrollbar on the right
+    scrollbar_width = 1
+    content_area = Rect(content.x, content.y, content.width - scrollbar_width, content.height - 3)
+    scrollbar_area = Rect(right(content_area), content.y, scrollbar_width, content.height - 3)
+
     # Render diff content using DiffView
     if m.diff_viewer !== nothing
         _debug_log("Rendering diff_viewer with $(length(m.diff_viewer.state.files)) files")
-        # Update viewer dimensions to fit modal
-        m.diff_viewer.state.width = content.width - 2
-        m.diff_viewer.state.height = content.height - 3
+        # Update viewer dimensions to fit modal (accounting for scrollbar)
+        m.diff_viewer.state.width = content_area.width - 2
+        m.diff_viewer.state.height = content_area.height
         
         # Render the diff widget inside the modal content area
-        DiffView.render_widget(buf, m.diff_viewer, content.x + 1, content.y, content.y + content.height - 3)
+        DiffView.render_widget(buf, m.diff_viewer, content_area.x + 1, content_area.y, content_area.y + content_area.height)
+        
+        # Calculate total lines for scrollbar
+        total_lines = 0
+        if !isempty(m.diff_viewer.state.files)
+            file = m.diff_viewer.state.files[m.diff_viewer.state.current_file]
+            for hunk in file.hunks
+                total_lines += length(hunk.lines)
+            end
+        end
+        
+        # Render scrollbar
+        _render_scrollbar!(buf, scrollbar_area, m.diff_viewer.state.scroll_offset, total_lines, content_area.height)
     else
         _debug_log("diff_viewer is nothing!")
     end
 
     # Help text at bottom
     help_y = content.y + content.height - 2
-    help_text = "y:confirm n:cancel Tab:toggle j/k:scroll"
+    help_text = "y:confirm n:cancel Tab:toggle j/k/↑/↓ scroll PgUp/PgDn Home/End"
     help_x = content.x + div(content.width - length(help_text), 2)
     set_string!(buf, help_x, help_y, help_text, Style(fg=ColorRGB(255, 255, 255), bold=true, bg=ColorRGB(20, 20, 25)))
 end
