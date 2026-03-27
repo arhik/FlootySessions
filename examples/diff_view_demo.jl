@@ -25,7 +25,7 @@ using Tachikoma
 using FlootySessions
 
 # Include the diff view component directly
-include(joinpath(@__DIR__, "..", "src", "diff_view.jl"))
+include(joinpath(@__DIR__, ".", "diff_view.jl"))
 using .DiffView
 
 @tachikoma_app
