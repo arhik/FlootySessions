@@ -713,7 +713,7 @@ end
 # ═══════════════════════════════════════════════════════════════════════
 # Modal States
 # ═══════════════════════════════════════════════════════════════════════
-@enum ModalState MODAL_NONE MODAL_DELETE_CONFIRM MODAL_SESSION_SWITCHER MODAL_MODEL_SELECT MODAL_DIFF_VIEW MODAL_SYSTEM_PROMPT MODAL_TOOL_PERMISSION
+@enum ModalState MODAL_NONE MODAL_DELETE_CONFIRM MODAL_SESSION_SWITCHER MODAL_MODEL_SELECT MODAL_DIFF_VIEW MODAL_SYSTEM_PROMPT MODAL_TOOL_PERMISSION MODAL_EDIT_DIFF
 
 # ═══════════════════════════════════════════════════════════════════════
 # TUI Model
@@ -778,6 +778,12 @@ end
     diff_view_path::String = ""     # File path being edited
     diff_view_tool_call::Any = nothing  # Tool call to execute if confirmed
     diff_view_split::Bool = false   # GitHub-style split view (true) vs unified (false)
+    
+    # Edit diff view state for message editing
+    edit_diff_old::String = ""      # Original message content
+    edit_diff_new::String = ""      # Edited message content
+    edit_diff_idx::Int = 0          # Index of message being edited
+    edit_diff_atts::Vector{Attachment} = []  # Attachments for edited message
 
     # Tool Permission System
     pending_tool_calls::Vector{Tuple{Symbol, Dict{String,Any}, ToolExecutionState}} = []
@@ -1535,9 +1541,11 @@ function _handle_chat_click!(m::TuiModel, evt::MouseEvent, sidebar_width::Int)
     clicked_idx = 0
 
     for (i, ctx_msg) in enumerate(context_messages)
+        # Get model from message metadata (the model used when message was sent)
+        msg_model = get(ctx_msg.metadata, "model", agent.model)
         widget = MessageWidget(ctx_msg.message, agent.name, content_width;
                               timestamp=ctx_msg.timestamp,
-                              model=agent.model,
+                              model=msg_model,
                               msg_agent_name=agent.name,
                               )
         msg_height = _calculate_widget_height(widget)
@@ -1958,13 +1966,13 @@ function _send_message!(m::TuiModel)
                     _debug_log("Response content: $(resp_content)")
                 end
 
-                # Update the user message metadata with the model used
-                # The user message should be at msg_count_before + 1
-                if length(agent.context.messages) > msg_count_before
-                    user_msg_idx = msg_count_before + 1
-                    if user_msg_idx <= length(agent.context.messages)
-                        ctx_msg = agent.context.messages[user_msg_idx]
-                        if role(ctx_msg.message) == "user"
+                # Update metadata with the model used for ALL new messages
+                # (user message, assistant response, and any tool messages)
+                for msg_idx in (msg_count_before + 1):length(agent.context.messages)
+                    if msg_idx <= length(agent.context.messages)
+                        ctx_msg = agent.context.messages[msg_idx]
+                        # Only set if not already set (preserve existing model info)
+                        if !haskey(ctx_msg.metadata, "model")
                             ctx_msg.metadata["model"] = current_model
                         end
                     end
@@ -2010,7 +2018,7 @@ function _send_message!(m::TuiModel)
                     _debug_log("Response content: $(resp_content)")
                 end
 
-                # Update metadata with attachment info
+                # Update metadata with attachment info and model for ALL new messages
                 # The user message should be at msg_count_before + 1
                 if length(agent.context.messages) > msg_count_before
                     user_msg_idx = msg_count_before + 1
@@ -2020,6 +2028,17 @@ function _send_message!(m::TuiModel)
                             ctx_msg.metadata["model"] = current_model
                             ctx_msg.metadata["attachment_paths"] = paths
                             ctx_msg.metadata["attachment_mimes"] = mimes
+                        end
+                    end
+                end
+                
+                # Set model on any other new messages (assistant, tool calls, etc.)
+                for msg_idx in (msg_count_before + 2):length(agent.context.messages)
+                    if msg_idx <= length(agent.context.messages)
+                        ctx_msg = agent.context.messages[msg_idx]
+                        # Only set if not already set
+                        if !haskey(ctx_msg.metadata, "model")
+                            ctx_msg.metadata["model"] = current_model
                         end
                     end
                 end
@@ -2128,6 +2147,16 @@ function _trigger_llm_response!(m::TuiModel, edited_text::String, attachments::V
                         end
                     end
                 end
+                
+                # Set model on all other new messages (assistant, tool calls, etc.)
+                for msg_idx in (msg_count_before + 2):length(agent.context.messages)
+                    if msg_idx <= length(agent.context.messages)
+                        ctx_msg = agent.context.messages[msg_idx]
+                        if !haskey(ctx_msg.metadata, "model")
+                            ctx_msg.metadata["model"] = current_model
+                        end
+                    end
+                end
 
 
                 # Process tool calls with permission system
@@ -2167,6 +2196,16 @@ function _trigger_llm_response!(m::TuiModel, edited_text::String, attachments::V
                             ctx_msg.metadata["model"] = current_model
                             ctx_msg.metadata["attachment_paths"] = paths
                             ctx_msg.metadata["attachment_mimes"] = mimes
+                        end
+                    end
+                end
+                
+                # Set model on all other new messages (assistant, tool calls, etc.)
+                for msg_idx in (msg_count_before + 2):length(agent.context.messages)
+                    if msg_idx <= length(agent.context.messages)
+                        ctx_msg = agent.context.messages[msg_idx]
+                        if !haskey(ctx_msg.metadata, "model")
+                            ctx_msg.metadata["model"] = current_model
                         end
                     end
                 end
@@ -3488,6 +3527,10 @@ function _continue_after_tools_inline!(m::TuiModel, agent::Agent)
             msgs_before = length(get_messages(context(agent)))
             _debug_log("Messages in context before chat: $msgs_before")
             
+            # Capture model before chat (current model is the one generating response)
+            current_model = agent.model
+            msg_count_before = length(get_messages(agent.context))
+            
             # Use public API to continue chat with tool results
             # Tool results are already in context, send empty message to get LLM response
             # stream=false for non-streaming response, auto_tools=false (we handle tools)
@@ -3495,14 +3538,25 @@ function _continue_after_tools_inline!(m::TuiModel, agent::Agent)
             response = chat(agent, ""; stream=false, auto_tools=false)
             _debug_log("chat returned: $(typeof(response))")
             
+            # Set model metadata on any new messages (assistant response)
+            msgs_after = length(get_messages(context(agent)))
+            if msgs_after > msg_count_before
+                for msg_idx in (msg_count_before + 1):length(agent.context.messages)
+                    if msg_idx <= length(agent.context.messages)
+                        ctx_msg = agent.context.messages[msg_idx]
+                        if !haskey(ctx_msg.metadata, "model")
+                            ctx_msg.metadata["model"] = current_model
+                        end
+                    end
+                end
+            end
+            
             if response isa AbstractFlootyError
                 _set_status!(m, "Chat error: $(response.message)")
                 _debug_log("Chat error: $(response.message)")
                 return
             end
             
-            # Log message count after chat
-            msgs_after = length(get_messages(context(agent)))
             _debug_log("Messages in context after chat: $msgs_after")
             
             # Check if response has more tool calls
@@ -3852,8 +3906,24 @@ Continue the chat after tools have been executed.
 function _continue_after_tools!(m::TuiModel, agent::Agent)
     @async begin
         try
+            # Capture model before chat (current model is the one generating response)
+            current_model = agent.model
+            msg_count_before = length(get_messages(agent.context))
+            
             # Call _do_chat directly without adding a user message
             response = FlootyAgents._do_chat(agent, false, false)
+            
+            # Set model metadata on the new assistant message
+            if length(agent.context.messages) > msg_count_before
+                for msg_idx in (msg_count_before + 1):length(agent.context.messages)
+                    if msg_idx <= length(agent.context.messages)
+                        ctx_msg = agent.context.messages[msg_idx]
+                        if !haskey(ctx_msg.metadata, "model")
+                            ctx_msg.metadata["model"] = current_model
+                        end
+                    end
+                end
+            end
             
             if response isa AbstractFlootyError
                 _set_status!(m, "Chat error: $(response.message)")
