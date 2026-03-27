@@ -21,9 +21,14 @@ using Tachikoma
 using FlootySessions
 using FlootySessions: Session, SessionManager, set_active_agent!, set_active_session!, create_session!, close_session!, get_active_session, SessionData, list_sessions, session_agents, SESSION_ACTIVE, SESSION_PAUSED, get_active_agent
 using FlootySessions: ToolExecutionState, prepare_tool_execution, submit_permission_response, execute_with_permission, initialize_permission_store!, get_permission_store, set_permission_mode!
+
+# Include diff view components directly (depends on Tachikoma)
+include(joinpath(@__DIR__, "..", "src", "diff_view.jl"))
+using .DiffView
 using FlootyAgents
 using FlootyAgents: Agent, create_agent, descendants, context
 using FlootyAbstract: AbstractMessage, AbstractProviderObject, AbstractAttachment, AbstractFlootyError, create_message, create_attachments, content, role, images, attachment_path, attachment_type, attachment_mime, provider, provider_name, list_provider_models, chat, chat_stream, call_name, call_arguments, execute_tool, tool_calls
+using IOCapture
 using DiffUtils
 using FlootyContextManager: add_message!, get_messages, get_full_history, ContextMessage
 using FlootyPersistence
@@ -772,14 +777,7 @@ end
     modal_selected::Symbol = :cancel
     modal_message::String = ""
 
-    # Diff view state for file editing
-    diff_view_old::String = ""      # Original file content
-    diff_view_new::String = ""      # New file content
-    diff_view_path::String = ""     # File path being edited
-    diff_view_tool_call::Any = nothing  # Tool call to execute if confirmed
-    diff_view_split::Bool = false   # GitHub-style split view (true) vs unified (false)
-    
-    # Edit diff view state for message editing
+    # Diff view state for file editing (uses DiffView component)
     edit_diff_old::String = ""      # Original message content
     edit_diff_new::String = ""      # Edited message content
     edit_diff_idx::Int = 0          # Index of message being edited
@@ -792,6 +790,13 @@ end
     waiting_for_tool_permission::Bool = false  # NEW: Waiting for user y/n/r
     current_tool_call::Any = nothing  # NEW: Current tool being approved/denied
     permission_agent::Any = nothing  # NEW: Agent for continuing after tool
+
+    # Edit tool diff state (for inline diff display)
+    diff_view_path::String = ""     # File path being edited
+    diff_view_old::String = ""      # Original file content
+    diff_view_new::String = ""      # New file content
+    diff_view_tool_call::Any = nothing  # Tool call to execute if confirmed
+    diff_viewer::Any = nothing      # DiffView.DiffViewer instance
 
     # Model selection
     available_models::Vector{String} = [
@@ -991,18 +996,6 @@ function _handle_key!(m::TuiModel, evt::KeyEvent)
             m.tool_permission_remember = !m.tool_permission_remember
             _set_status!(m, m.tool_permission_remember ? "Will remember choice" : "Won't remember choice")
             return
-        elseif evt.key == :f7
-            # Show diff view when waiting for write tool permission
-            if m.waiting_for_tool_permission && m.current_tool_call !== nothing
-                tool_name, args, state = m.current_tool_call
-                if haskey(args, "path")
-                    path = args["path"]
-                    new_content = get(args, "content", "")
-                    old_content = isfile(path) ? read(path, String) : ""
-                    show_diff_view!(m, path, old_content, new_content, nothing)
-                    return
-                end
-            end
         end
     end
 
@@ -1317,14 +1310,43 @@ function _handle_modal_key!(m::TuiModel, evt::KeyEvent)
             m.modal = MODAL_NONE
         end
     elseif m.modal == MODAL_DIFF_VIEW
+        _debug_log("MODAL_DIFF_VIEW key: $(evt.key) char=$(evt.key == :char ? evt.char : string(['n', '\\', 'a']))")
         if evt.key == :char && evt.char == 'y'
-            # Confirm - execute the tool call
+            _debug_log("Confirming diff tool call")
             _execute_diff_tool_call!(m)
             m.modal = MODAL_NONE
         elseif evt.key == :char && evt.char == 'n' || evt.key == :escape
-            # Cancel
+            _debug_log("Cancelling diff tool call")
             _set_status!(m, "File edit cancelled")
             m.modal = MODAL_NONE
+            # Clear diff view state
+            m.diff_view_path = ""
+            m.diff_view_old = ""
+            m.diff_view_new = ""
+            m.diff_view_tool_call = nothing
+            m.diff_viewer = nothing
+            _debug_log("Cleared diff view state on cancel")
+        elseif evt.key == :char && evt.char == 'j' || evt.key == :down
+            if m.diff_viewer !== nothing
+                DiffView.move_cursor!(m.diff_viewer.state, 1)
+            end
+        elseif evt.key == :char && evt.char == 'k' || evt.key == :up
+            if m.diff_viewer !== nothing
+                DiffView.move_cursor!(m.diff_viewer.state, -1)
+            end
+        elseif evt.key == :char && evt.char == '\t'
+            if m.diff_viewer !== nothing
+                DiffView.toggle_view_mode!(m.diff_viewer.state)
+            end
+        end
+    elseif m.modal == MODAL_EDIT_DIFF
+        if evt.key == :char && evt.char == 'y'
+            # Confirm edit save
+            m.modal = MODAL_NONE
+            _confirm_edit_save!(m)
+        elseif evt.key == :char && evt.char == 'n' || evt.key == :escape
+            # Cancel - return to edit mode
+            _cancel_edit_save!(m)
         end
     elseif m.modal == MODAL_SYSTEM_PROMPT
         if evt.key == :escape || evt.key == :char && evt.char == 'q'
@@ -1761,19 +1783,42 @@ function _save_edited_message!(m::TuiModel)
     # Get the ContextMessage to edit
     ctx_msg = context_messages[m.editing_message_idx]
     msg = ctx_msg.message
+    
+    # Get original content
+    old_content = content(msg) === nothing ? "" : content(msg)
+    
+    # Get edited content
+    new_content = String(strip(join([String(l) for l in m.edit_area.lines], "\n")))
+    isempty(new_content) && return
+    
+    # Store for diff view
+    m.edit_diff_old = old_content
+    m.edit_diff_new = new_content
+    m.edit_diff_idx = m.editing_message_idx
+    m.edit_diff_atts = copy(m.edit_attachments)
+    
+    # Show diff modal instead of saving directly
+    m.modal = MODAL_EDIT_DIFF
+    m.modal_selected = :cancel  # Default to cancel for safety
+    _set_status!(m, "Review changes before saving (y:save n:cancel)")
+end
 
-    # Get the widget's edit text
-    widget = MessageWidget(msg, m.current_session.root_agent.name, 80;
-                          is_editing=true, timestamp=ctx_msg.timestamp)
-    # Find the actual widget in the render cache or recreate
-    # For now, we'll use a simpler approach - get text from the message's widget if stored
-    # Actually, we need to store the edit text somewhere accessible
+"""
+    _confirm_edit_save!(m::TuiModel)
 
-    # Since we can't easily access the widget's edit_text from here,
-    # let's store it in the model when editing
-    new_text = String(strip(join([String(l) for l in m.edit_area.lines], "\n")))
-    isempty(new_text) && return
+Actually save the edited message after diff review.
+"""
+function _confirm_edit_save!(m::TuiModel)
+    m.current_session === nothing && return
+    m.current_session.root_agent === nothing && return
+    
+    context_messages = get_full_history(m.current_session.root_agent.context)
+    m.edit_diff_idx < 1 && return
+    m.edit_diff_idx > length(context_messages) && return
 
+    # Get the ContextMessage to edit
+    ctx_msg = context_messages[m.edit_diff_idx]
+    
     # Update the message content in the store
     agent = m.current_session.root_agent
     store = agent.context
@@ -1788,12 +1833,6 @@ function _save_edited_message!(m::TuiModel)
         num_removed = length(store.messages) - idx + 1
         resize!(store.messages, idx - 1)
 
-        # DON'T add the message here - let chat() add it
-        # This prevents duplicate messages
-
-        # Save attachments before clearing edit mode
-        edit_atts = copy(m.edit_attachments)
-
         _set_status!(m, "Message updated, history truncated ($num_removed messages removed), sending to LLM...")
         _auto_save!(m)
 
@@ -1807,20 +1846,31 @@ function _save_edited_message!(m::TuiModel)
         m.selected_message_idx = nothing
 
         # Trigger LLM to respond with attachments
+        new_text = m.edit_diff_new
+        edit_atts = m.edit_diff_atts
+        
+        # Clear diff state
+        m.edit_diff_old = ""
+        m.edit_diff_new = ""
+        m.edit_diff_idx = 0
+        empty!(m.edit_diff_atts)
+        
         _trigger_llm_response!(m, new_text, edit_atts)
-
-        return  # Early return
     else
         _set_status!(m, "Failed: message not found")
+        _cancel_edit_save!(m)
     end
+end
 
-    # Exit edit mode (only reached on failure)
-    m.edit_mode = false
-    m.editing_message_idx = nothing
-    empty!(m.edit_area.lines)
-    m.edit_area.cursor_row = 1; m.edit_area.cursor_col = 0
-    m.message_select_mode = true  # Return to select mode
-    m.selected_message_idx = nothing
+"""
+    _cancel_edit_save!(m::TuiModel)
+
+Cancel the edit save and return to edit mode.
+"""
+function _cancel_edit_save!(m::TuiModel)
+    m.modal = MODAL_NONE
+    m.modal_selected = :cancel
+    _set_status!(m, "Edit cancelled - still in edit mode (F9:save Esc:cancel)")
 end
 
 function _open_model_select_modal!(m::TuiModel)
@@ -2930,12 +2980,14 @@ function _render_queue_panel!(m::TuiModel, buf::Buffer, area::Rect)
 end
 
 function _render_modal!(m::TuiModel, buf::Buffer, area::Rect)
-    if m.modal == MODAL_DELETE_CONFIRM
+    if m.modal == MODAL_DIFF_VIEW
+        _render_diff_view_modal!(m, buf, area)
+    elseif m.modal == MODAL_DELETE_CONFIRM
         _render_delete_modal!(m, buf, area)
     elseif m.modal == MODAL_MODEL_SELECT
         _render_model_select_modal!(m, buf, area)
-    elseif m.modal == MODAL_DIFF_VIEW
-        _render_diff_view_modal!(m, buf, area)
+    elseif m.modal == MODAL_EDIT_DIFF
+        _render_edit_diff_modal!(m, buf, area)
     elseif m.modal == MODAL_SYSTEM_PROMPT
         _render_system_prompt_modal!(m, buf, area)
     # MODAL_TOOL_PERMISSION removed - using inline system messages instead
@@ -2954,6 +3006,53 @@ function _render_delete_modal!(m::TuiModel, buf::Buffer, area::Rect)
     )
 
     render(modal, area, buf)
+end
+
+function _render_diff_view_modal!(m::TuiModel, buf::Buffer, area::Rect)
+    _debug_log("Rendering MODAL_DIFF_VIEW for $(m.diff_view_path)")
+    # Title showing file path
+    title = " File Edit: $(basename(m.diff_view_path)) "
+    title_style = Style(fg=ColorRGB(255, 200, 100), bold=true)
+
+    # Calculate modal dimensions
+    modal_width = min(120, area.width - 4)
+    modal_height = min(45, area.height - 4)
+    modal_rect = center(area, modal_width, modal_height)
+
+    # Fill modal background first
+    for y in modal_rect.y:modal_rect.y + modal_rect.height - 1
+        for x in modal_rect.x:modal_rect.x + modal_rect.width - 1
+            set_string!(buf, x, y, " ", Style(bg=ColorRGB(20, 20, 25)))
+        end
+    end
+
+    # Draw border
+    block = Block(
+        title=title,
+        border_style=Style(fg=Color256(245), bg=ColorRGB(20, 20, 25)),
+        title_style=title_style,
+        box=BOX_HEAVY,
+    )
+    content = render(block, modal_rect, buf)
+
+    # Render diff content using DiffView
+    if m.diff_viewer !== nothing
+        _debug_log("Rendering diff_viewer with $(length(m.diff_viewer.state.files)) files")
+        # Update viewer dimensions to fit modal
+        m.diff_viewer.state.width = content.width - 2
+        m.diff_viewer.state.height = content.height - 3
+        
+        # Render the diff widget inside the modal content area
+        DiffView.render_widget(buf, m.diff_viewer, content.x + 1, content.y, content.y + content.height - 3)
+    else
+        _debug_log("diff_viewer is nothing!")
+    end
+
+    # Help text at bottom
+    help_y = content.y + content.height - 2
+    help_text = "y:confirm n:cancel Tab:toggle j/k:scroll"
+    help_x = content.x + div(content.width - length(help_text), 2)
+    set_string!(buf, help_x, help_y, help_text, Style(fg=ColorRGB(255, 255, 255), bold=true, bg=ColorRGB(20, 20, 25)))
 end
 
 function _render_model_select_modal!(m::TuiModel, buf::Buffer, area::Rect)
@@ -2986,9 +3085,9 @@ function _render_model_select_modal!(m::TuiModel, buf::Buffer, area::Rect)
     set_string!(buf, content.x + 1, help_y, "Enter:select Esc:cancel", GREY_DIM)
 end
 
-function _render_diff_view_modal!(m::TuiModel, buf::Buffer, area::Rect)
-    # Title showing file path
-    title = " File Edit: $(basename(m.diff_view_path)) "
+function _render_edit_diff_modal!(m::TuiModel, buf::Buffer, area::Rect)
+    # Title
+    title = " Confirm Message Edit "
     title_style = Style(fg=ColorRGB(255, 200, 100), bold=true)
 
     # Calculate modal dimensions (use most of the screen)
@@ -3005,21 +3104,15 @@ function _render_diff_view_modal!(m::TuiModel, buf::Buffer, area::Rect)
     )
     content = render(block, modal_rect, buf)
 
-    # Calculate diff using DiffUtils for proper unified diff
-    old_lines = collect(eachline(IOBuffer(m.diff_view_old)))
-    new_lines = collect(eachline(IOBuffer(m.diff_view_new)))
-
     # Generate unified diff
-    diff_result = DiffUtils.diff(old_lines, new_lines; context=3)
-    diff_str = sprint(io -> DiffUtils.export_unified(io, diff_result,
-        old_label="a/$(basename(m.diff_view_path))",
-        new_label="b/$(basename(m.diff_view_path))"))
-
-    # Split into lines for rendering
-    diff_lines = split(diff_str, '\n')
-
-    # If no changes detected
-    if isempty(diff_lines) || (length(diff_lines) == 1 && isempty(diff_lines[1]))
+    old_lines = collect(eachline(IOBuffer(m.edit_diff_old)))
+    new_lines = collect(eachline(IOBuffer(m.edit_diff_new)))
+    
+    diff_text = generate_unified_diff(m.edit_diff_old, m.edit_diff_new, "message")
+    
+    diff_lines = collect(eachline(IOBuffer(diff_text)))
+    
+    if isempty(diff_lines) || all(isempty, diff_lines)
         diff_lines = ["(No changes)"]
     end
 
@@ -3062,7 +3155,10 @@ function _render_diff_view_modal!(m::TuiModel, buf::Buffer, area::Rect)
 
     # Help text at bottom
     help_y = bottom(content) - 1
-    help_text = "y:confirm n:cancel"
+    help_text = "y:save changes n:cancel "
+    if !isempty(m.edit_diff_atts)
+        help_text *= "($(length(m.edit_diff_atts)) attachments)"
+    end
     help_x = content.x + div(content.width - length(help_text), 2)
     set_string!(buf, help_x, help_y, help_text, Style(fg=ColorRGB(255, 255, 255), bold=true))
 end
@@ -3070,15 +3166,30 @@ end
 """
     show_diff_view!(m::TuiModel, path::String, old_content::String, new_content::String, tool_call)
 
-Show a diff view modal for file editing, asking user for confirmation.
+Store diff info for inline rendering when edit tool is called.
+The diff will be shown as a colored message in chat.
 """
 function show_diff_view!(m::TuiModel, path::String, old_content::String, new_content::String, tool_call)
     m.diff_view_path = path
     m.diff_view_old = old_content
     m.diff_view_new = new_content
     m.diff_view_tool_call = tool_call
+    
+    # Create diff viewer with proper colors
+    width = min(120, m.layout_chat_width - 4)
+    height = 40
+    m.diff_viewer = DiffView.DiffViewer(width, height; view_mode=DiffView.MODE_SPLIT, word_wrap=true)
+    
+    # Generate unified diff and load it
+    diff_text = generate_unified_diff(old_content, new_content, path)
+    _debug_log("Generated diff for $path: $(length(diff_text)) chars")
+    DiffView.load_diff!(m.diff_viewer, diff_text)
+    _debug_log("Loaded diff into viewer: $(length(m.diff_viewer.state.files)) files")
+    
+    # Open diff view modal
     m.modal = MODAL_DIFF_VIEW
-    _set_status!(m, "Review changes to $(basename(path)) - y:confirm n:cancel")
+    _debug_log("Opened MODAL_DIFF_VIEW for $path")
+    _set_status!(m, "Review changes to $(basename(path)) - y:confirm n:cancel Tab:toggle j/k:scroll")
 end
 
 """
@@ -3087,22 +3198,18 @@ end
 Execute the stored tool call after user confirms in diff view.
 """
 function _execute_diff_tool_call!(m::TuiModel)
+    _debug_log("_execute_diff_tool_call! starting")
     if m.diff_view_tool_call === nothing
+        _debug_log("No tool call to execute")
         _set_status!(m, "No tool call to execute")
         return
     end
 
     # Execute the tool
-    tc = m.diff_view_tool_call
-    
-    # If no tool call stored (from F7 inline), use current_tool_call
-    if tc === nothing && m.current_tool_call !== nothing
-        tool_name, args, state = m.current_tool_call
-        tool_name_str = string(tool_name)
-    else
-        tool_name_str = call_name(tc)
-        args = call_arguments(tc)
-    end
+    # diff_view_tool_call is a tuple: (tool_name, args, state)
+    tool_name, args, state = m.diff_view_tool_call
+    tool_name_str = string(tool_name)
+    _debug_log("Executing tool: $tool_name_str with args: $args")
 
     _set_status!(m, "Executing $tool_name_str...")
 
@@ -3111,10 +3218,30 @@ function _execute_diff_tool_call!(m::TuiModel)
         try
             result = execute_tool(tool_name_str, args)
 
+            # Get agent for adding result to context
+            agent = m.permission_agent
+            
             if result.success
                 _set_status!(m, "✓ File edited: $(basename(m.diff_view_path))")
+                
+                # Add tool result to context if agent available
+                if agent !== nothing
+                    args_str = join(["$k=$v" for (k, v) in args], " ")
+                    output = result.data
+                    tool_content = """\$ $tool_name_str $args_str\n$output"""
+                    tool_msg = create_message(provider(agent), "tool", tool_content)
+                    add_message!(context(agent), tool_msg)
+                    _debug_log("Added tool result to context")
+                end
             else
                 _set_status!(m, "✗ Failed: $(result.error)")
+            end
+            
+            # Continue chat after tool execution
+            if agent !== nothing
+                m.waiting_for_tool_permission = false
+                m.current_tool_call = nothing
+                _continue_after_tools_inline!(m, agent)
             end
         catch e
             _set_status!(m, "✗ Error: $e")
@@ -3125,6 +3252,8 @@ function _execute_diff_tool_call!(m::TuiModel)
         m.diff_view_old = ""
         m.diff_view_new = ""
         m.diff_view_tool_call = nothing
+        m.diff_viewer = nothing
+        _debug_log("Cleared diff view state")
     end
 end
 
@@ -3311,30 +3440,28 @@ function _show_next_tool_request!(m::TuiModel, agent::Agent)
             end
         end
         
-        # Generate inline summary
-        old_lines = isempty(old_content) ? 0 : countlines(IOBuffer(old_content))
-        new_lines = isempty(new_content) ? 0 : countlines(IOBuffer(new_content))
-        
+        # For new files, show simple confirmation
+        # For edits, show diff view
         if isempty(old_content)
-            change_summary = "(new file: $new_lines lines)"
-        else
-            diff_lines = new_lines - old_lines
-            if diff_lines > 0
-                change_summary = "(+$(diff_lines) lines)"
-            elseif diff_lines < 0
-                change_summary = "($diff_lines lines)"
-            else
-                change_summary = "(modified)"
-            end
-        end
-        
-        tool_request_msg = """🔧 Write: $path $change_summary
+            # New file - show simple summary
+            new_lines = isempty(new_content) ? 0 : countlines(IOBuffer(new_content))
+            tool_request_msg = """🔧 Write: $path (new file: $new_lines lines)
    
-   Press 'y' to allow | 'n' to deny | 'r' to remember | F7:diff"""
-        
-        prov = provider(agent)
-        sys_msg = create_message(prov, "system", tool_request_msg)
-        add_message!(context(agent), sys_msg)
+   Press 'y' to allow | 'n' to deny | 'r' to remember"""
+            
+            prov = provider(agent)
+            sys_msg = create_message(prov, "system", tool_request_msg)
+            add_message!(context(agent), sys_msg)
+        else
+            # Existing file - show diff inline
+            old_lines_count = countlines(IOBuffer(old_content))
+            new_lines_count = isempty(new_content) ? 0 : countlines(IOBuffer(new_content))
+            diff_lines = new_lines_count - old_lines_count
+            
+            # Show diff modal
+            show_diff_view!(m, path, old_content, new_content, tc)
+            return  # Early return, modal handles the rest
+        end
     else
         cmd_str = !isempty(args) ? join(["$k=$v" for (k, v) in args], " ") : ""
         tool_request_msg = """🔧 Tool Request: $(string(tool_name)) $cmd_str
@@ -4058,5 +4185,74 @@ $output"""
     end
     
     return true
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# Diff Helper Functions
+# ═══════════════════════════════════════════════════════════════════════
+
+"""
+    generate_unified_diff(old_content::String, new_content::String, path::String) -> String
+
+Generate a unified diff string for previewing changes.
+"""
+function generate_unified_diff(old_content::String, new_content::String, path::String)::String
+    # Write temp files and use system diff for proper unified diff format
+    old_file = tempname()
+    new_file = tempname()
+    
+    try
+        write(old_file, old_content)
+        write(new_file, new_content)
+        
+        # Try system diff - returns exit code 1 when files differ
+        result = IOCapture.capture(rethrow=Union{}) do
+            run(`diff -u "$old_file" "$new_file"`)
+        end
+        
+        if length(result.output) > 0
+            output = result.output
+            # Fix the paths in the diff header
+            output = replace(output, "--- " * old_file => "--- a/" * path)
+            output = replace(output, "+++ " * new_file => "+++ b/" * path)
+            return output
+        end
+    catch
+        # Fallback to simple diff if system diff fails
+    finally
+        rm(old_file, force=true)
+        rm(new_file, force=true)
+    end
+    
+    # Fallback: simple line-by-line diff
+    io = IOBuffer()
+    
+    old_lines = isempty(strip(old_content)) ? String[] : split(old_content, '\n')
+    new_lines = isempty(strip(new_content)) ? String[] : split(new_content, '\n')
+    
+    println(io, "--- a/", path)
+    println(io, "+++ b/", path)
+    println(io, "@@ -1,$(length(old_lines)) +1,$(length(new_lines)) @@")
+    
+    max_len = max(length(old_lines), length(new_lines))
+    for i in 1:max_len
+        o = i <= length(old_lines) ? old_lines[i] : nothing
+        n = i <= length(new_lines) ? new_lines[i] : nothing
+        
+        if o === nothing && n !== nothing
+            println(io, "+", n)
+        elseif o !== nothing && n === nothing
+            println(io, "-", o)
+        elseif o !== nothing && n !== nothing
+            if o == n
+                println(io, " ", n)
+            else
+                println(io, "-", o)
+                println(io, "+", n)
+            end
+        end
+    end
+    
+    String(take!(io))
 end
 
