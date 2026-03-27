@@ -13,7 +13,7 @@ catch
     using Tachikoma
 end
 
-include(joinpath(@__DIR__, "..", "src", "diff_view.jl"))
+include(joinpath(@__DIR__, ".", "diff_view.jl"))
 using .DiffView
 
 @tachikoma_app
