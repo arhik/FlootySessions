@@ -928,7 +928,9 @@ end
 # Event Handling
 # ═══════════════════════════════════════════════════════════════════════
 function update!(m::TuiModel, evt::Event)
+    _debug_log("UPDATE_GOT: $(typeof(evt))")
     if evt isa KeyEvent
+        _debug_log("UPDATE_KEY: modal=$(m.modal), key=$(evt.key), char=$(evt.key == :char ? evt.char : '-')")
         _handle_key!(m, evt)
     elseif evt isa MouseEvent
         _debug_log("MouseEvent: x=$(evt.x), y=$(evt.y), button=$(evt.button), action=$(evt.action)")
@@ -1276,6 +1278,11 @@ function _handle_key!(m::TuiModel, evt::KeyEvent)
 end
 
 function _handle_modal_key!(m::TuiModel, evt::KeyEvent)
+    _debug_log("MODAL_KEY_ENTRY: modal=$(m.modal), key=$(evt.key)")
+    if m.modal == MODAL_DIFF_VIEW
+        _debug_log("DIFF_VIEW_KEY: $(evt.key) char=$(evt.key == :char ? evt.char : '-')")
+    end
+    _debug_log("MODAL_KEY: modal=$(m.modal), key=$(evt.key), char=$(evt.key == :char ? evt.char : '-')")
     if m.modal == MODAL_DELETE_CONFIRM
         if evt.key == :left
             m.modal_selected = :cancel
@@ -1311,13 +1318,14 @@ function _handle_modal_key!(m::TuiModel, evt::KeyEvent)
             m.modal = MODAL_NONE
         end
     elseif m.modal == MODAL_DIFF_VIEW
-        _debug_log("MODAL_DIFF_VIEW key: $(evt.key) char=$(evt.key == :char ? evt.char : string(['n', '\\', 'a']))")
+        _debug_log("MODAL_DIFF_VIEW key: $(evt.key) char=$(evt.key == :char ? evt.char : '-')")
         if evt.key == :char && evt.char == 'y'
             _debug_log("Confirming diff tool call")
             _execute_diff_tool_call!(m)
             m.modal = MODAL_NONE
         elseif evt.key == :char && evt.char == 'n' || evt.key == :escape
             _debug_log("Cancelling diff tool call")
+            _debug_log("current_tool_call=$(m.current_tool_call !== nothing), waiting_for_permission=$(m.waiting_for_tool_permission)")
             m.modal = MODAL_NONE
             # Clear diff view state
             m.diff_view_path = ""
@@ -1327,43 +1335,68 @@ function _handle_modal_key!(m::TuiModel, evt::KeyEvent)
             m.diff_viewer = nothing
             _debug_log("Cleared diff view state on cancel")
             # Properly deny the tool and continue chat
-            _deny_tool_inline!(m)
+            try
+                _deny_tool_inline!(m)
+            catch e
+                _debug_log("Error in _deny_tool_inline!: $e")
+                _set_status!(m, "Error denying tool: $e")
+                m.waiting_for_tool_permission = false
+                m.current_tool_call = nothing
+            end
         elseif evt.key == :char && evt.char == 'j' || evt.key == :down
             if m.diff_viewer !== nothing
-                DiffView.move_cursor!(m.diff_viewer.state, 1)
+                m.diff_viewer.state.scroll_offset += 1
+                _set_status!(m, "Scroll: $(m.diff_viewer.state.scroll_offset)")
             end
         elseif evt.key == :char && evt.char == 'k' || evt.key == :up
             if m.diff_viewer !== nothing
-                DiffView.move_cursor!(m.diff_viewer.state, -1)
+                _debug_log("SCROLL: k/up pressed")
+                state = m.diff_viewer.state
+                old_offset = state.scroll_offset
+                state.scroll_offset = max(state.scroll_offset - 1, 0)
+                _debug_log("SCROLL: offset $old_offset -> $(state.scroll_offset)")
             end
-        elseif evt.key == :page_down
+        elseif evt.key == :pageup
             if m.diff_viewer !== nothing
-                DiffView.move_cursor!(m.diff_viewer.state, m.diff_viewer.state.height)
+                _debug_log("SCROLL: PgUp pressed")
+                state = m.diff_viewer.state
+                total_lines = DiffView.count_lines(state)
+                old_offset = state.scroll_offset
+                state.scroll_offset = max(state.scroll_offset - state.height, 0)
+                _debug_log("SCROLL: PgUp offset $old_offset -> $(state.scroll_offset)")
             end
-        elseif evt.key == :page_up
+        elseif evt.key == :pagedown
             if m.diff_viewer !== nothing
-                DiffView.move_cursor!(m.diff_viewer.state, -m.diff_viewer.state.height)
+                _debug_log("SCROLL: PgDn pressed")
+                state = m.diff_viewer.state
+                total_lines = DiffView.count_lines(state)
+                old_offset = state.scroll_offset
+                state.scroll_offset = min(state.scroll_offset + state.height, max(0, total_lines - state.height))
+                _debug_log("SCROLL: PgDn offset $old_offset -> $(state.scroll_offset)")
             end
         elseif evt.key == :home
             if m.diff_viewer !== nothing
+                _debug_log("SCROLL: Home pressed")
+                old_offset = m.diff_viewer.state.scroll_offset
                 m.diff_viewer.state.scroll_offset = 0
+                _debug_log("SCROLL: Home offset $old_offset -> 0")
             end
-        elseif evt.key == :end
+        elseif evt.key == :end_key
             if m.diff_viewer !== nothing
-                # Calculate total lines
-                total_lines = 0
-                if !isempty(m.diff_viewer.state.files)
-                    file = m.diff_viewer.state.files[m.diff_viewer.state.current_file]
-                    for hunk in file.hunks
-                        total_lines += length(hunk.lines)
-                    end
-                end
+                _debug_log("SCROLL: End pressed")
+                total_lines = DiffView.count_lines(m.diff_viewer.state)
+                old_offset = m.diff_viewer.state.scroll_offset
                 m.diff_viewer.state.scroll_offset = max(0, total_lines - m.diff_viewer.state.height)
+                _debug_log("SCROLL: End offset $old_offset -> $(m.diff_viewer.state.scroll_offset) (total=$total_lines)")
             end
-        elseif evt.key == :char && evt.char == '\t'
+        elseif evt.key == :tab
             if m.diff_viewer !== nothing
+                old_mode = m.diff_viewer.state.view_mode
                 DiffView.toggle_view_mode!(m.diff_viewer.state)
+                _debug_log("TAB: toggled view mode $old_mode -> $(m.diff_viewer.state.view_mode)")
             end
+        else
+            _debug_log("MODAL_DIFF_VIEW: unhandled key $(evt.key) char=$(evt.key == :char ? evt.char : '-')")
         end
     elseif m.modal == MODAL_EDIT_DIFF
         if evt.key == :char && evt.char == 'y'
@@ -3072,22 +3105,32 @@ function _render_diff_view_modal!(m::TuiModel, buf::Buffer, area::Rect)
 
     # Render diff content using DiffView
     if m.diff_viewer !== nothing
-        _debug_log("Rendering diff_viewer with $(length(m.diff_viewer.state.files)) files")
+        _debug_log("Rendering diff_viewer: $(length(m.diff_viewer.state.files)) files, current_file_idx=$(m.diff_viewer.state.current_file_idx)")
+        if !isempty(m.diff_viewer.state.files)
+            file = m.diff_viewer.state.files[m.diff_viewer.state.current_file_idx]
+            _debug_log("Current file: $(file.old_path) -> $(file.new_path), hunks=$(length(file.hunks))")
+            for (i, hunk) in enumerate(file.hunks)
+                _debug_log("  Hunk $i: lines=$(length(hunk.lines))")
+            end
+        end
         # Update viewer dimensions to fit modal (accounting for scrollbar)
         m.diff_viewer.state.width = content_area.width - 2
         m.diff_viewer.state.height = content_area.height
         
         # Render the diff widget inside the modal content area
+        _debug_log("Before render_widget: content_area=($(content_area.x),$(content_area.y),$(content_area.width),$(content_area.height))")
         DiffView.render_widget(buf, m.diff_viewer, content_area.x + 1, content_area.y, content_area.y + content_area.height)
+        _debug_log("After render_widget")
         
-        # Calculate total lines for scrollbar
+        # Calculate total lines for debugging
         total_lines = 0
         if !isempty(m.diff_viewer.state.files)
-            file = m.diff_viewer.state.files[m.diff_viewer.state.current_file]
+            file = m.diff_viewer.state.files[m.diff_viewer.state.current_file_idx]
             for hunk in file.hunks
-                total_lines += length(hunk.lines)
+                total_lines += length(hunk.lines) + 1  # +1 for hunk header
             end
         end
+        _debug_log("DiffView: height=$(content_area.height), visible_lines=$total_lines, scroll_offset=$(m.diff_viewer.state.scroll_offset)")
         
         # Render scrollbar
         _render_scrollbar!(buf, scrollbar_area, m.diff_viewer.state.scroll_offset, total_lines, content_area.height)
@@ -3229,9 +3272,10 @@ function show_diff_view!(m::TuiModel, path::String, old_content::String, new_con
     
     # Generate unified diff and load it
     diff_text = generate_unified_diff(old_content, new_content, path)
-    _debug_log("Generated diff for $path: $(length(diff_text)) chars")
+    _debug_log("Generated diff for $path: $(length(diff_text)) chars, $(count(==('\n'), diff_text)) lines")
     DiffView.load_diff!(m.diff_viewer, diff_text)
-    _debug_log("Loaded diff into viewer: $(length(m.diff_viewer.state.files)) files")
+    total_hunks = isempty(m.diff_viewer.state.files) ? 0 : sum(f -> length(f.hunks), m.diff_viewer.state.files)
+    _debug_log("Loaded diff: $(length(m.diff_viewer.state.files)) files, $total_hunks hunks, $(DiffView.count_lines(m.diff_viewer.state)) total lines")
     
     # Open diff view modal
     m.modal = MODAL_DIFF_VIEW
@@ -3263,10 +3307,16 @@ function _execute_diff_tool_call!(m::TuiModel)
     # Execute in async task
     @async begin
         try
-            result = execute_tool(tool_name_str, args)
-
             # Get agent for adding result to context
             agent = m.permission_agent
+            
+            # Remove tool from pending queue FIRST (before any async operations)
+            if !isempty(m.pending_tool_calls)
+                popfirst!(m.pending_tool_calls)
+                _debug_log("Removed tool from pending queue, remaining: $(length(m.pending_tool_calls))")
+            end
+            
+            result = execute_tool(tool_name_str, args)
             
             if result.success
                 _set_status!(m, "✓ File edited: $(basename(m.diff_view_path))")
@@ -3288,7 +3338,14 @@ function _execute_diff_tool_call!(m::TuiModel)
             if agent !== nothing
                 m.waiting_for_tool_permission = false
                 m.current_tool_call = nothing
-                _continue_after_tools_inline!(m, agent)
+                
+                # Show next tool if any left, otherwise continue chat
+                if !isempty(m.pending_tool_calls)
+                    _debug_log("More tools pending, showing next...")
+                    _show_next_tool_request!(m, agent)
+                else
+                    _continue_after_tools_inline!(m, agent)
+                end
             end
         catch e
             _set_status!(m, "✗ Error: $e")
@@ -3505,6 +3562,18 @@ function _show_next_tool_request!(m::TuiModel, agent::Agent)
             new_lines_count = isempty(new_content) ? 0 : countlines(IOBuffer(new_content))
             diff_lines = new_lines_count - old_lines_count
             
+            # Set waiting state BEFORE showing modal (needed for deny to work)
+            m.waiting_for_tool_permission = true
+            m.current_tool_call = tc
+            
+            # Show tool request message first
+            tool_request_msg = """🔧 Edit: $path ($(old_lines_count) → $(new_lines_count) lines, $(diff_lines>0 ? "+" : "")$diff_lines)
+
+   Review the changes in the modal below"""
+            prov = provider(agent)
+            sys_msg = create_message(prov, "system", tool_request_msg)
+            add_message!(context(agent), sys_msg)
+            
             # Show diff modal
             show_diff_view!(m, path, old_content, new_content, tc)
             return  # Early return, modal handles the rest
@@ -3521,12 +3590,14 @@ function _show_next_tool_request!(m::TuiModel, agent::Agent)
     end
     
     # Debug log
-        _debug_log("Showing tool request: $(string(tool_name)), pending queue: $(length(m.pending_tool_calls))")
-        
-        # Set waiting state
+    _debug_log("Showing tool request: $(string(tool_name)), pending queue: $(length(m.pending_tool_calls))")
+    
+    # Set waiting state (already set for diff view, but set again for consistency)
+    if string(tool_name) ∉ ["write", "edit"] || !haskey(args, "path") || !isfile(args["path"])
         m.waiting_for_tool_permission = true
         m.current_tool_call = tc
-        _set_status!(m, "🔧 TOOL REQUEST: $(string(tool_name)) | Queue: $(length(m.pending_tool_calls)) | Press y:allow n:deny")
+    end
+    _set_status!(m, "🔧 TOOL REQUEST: $(string(tool_name)) | Queue: $(length(m.pending_tool_calls)) | Press y:allow n:deny")
 end
 
 """
@@ -3636,19 +3707,27 @@ end
 Deny the current tool and add denial message.
 """
 function _deny_tool_inline!(m::TuiModel)
-    isempty(m.pending_tool_calls) && (m.waiting_for_tool_permission = false; return)
-    m.current_tool_call === nothing && (m.waiting_for_tool_permission = false; return)
+    _debug_log("_deny_tool_inline! starting")
+    isempty(m.pending_tool_calls) && (_debug_log("No pending tool calls"); m.waiting_for_tool_permission = false; return)
+    m.current_tool_call === nothing && (_debug_log("No current tool call"); m.waiting_for_tool_permission = false; return)
     
     tool_name, args, state = m.current_tool_call
+    _debug_log("Denying tool: $tool_name")
     agent = m.permission_agent
-    agent === nothing && (m.waiting_for_tool_permission = false; return)
+    agent === nothing && (_debug_log("No permission agent"); m.waiting_for_tool_permission = false; return)
     
     # Check if request exists
     if state.request === nothing
         # No request was created - just skip this tool
         popfirst!(m.pending_tool_calls)
         prov = provider(agent)
-        denial_msg = create_message(prov, "tool", "\$ $tool_name ...\n\n[SKIPPED - Denied by user]")
+        denial_msg = create_message(prov, "assistant", """I attempted to use the '$tool_name' tool but you denied permission.
+
+Could you let me know:
+1. What would you prefer I do instead?
+2. Why was this tool denied? (so I can avoid similar issues)
+
+I'll wait for your guidance before proceeding.""")
         add_message!(context(agent), denial_msg)
         _set_status!(m, "✗ Denied: $tool_name")
         
@@ -3669,9 +3748,15 @@ function _deny_tool_inline!(m::TuiModel)
     # Remove from queue
     popfirst!(m.pending_tool_calls)
     
-    # Add denial message
+    # Add denial message as assistant explaining the denial and asking for next steps
     prov = provider(agent)
-    denial_msg = create_message(prov, "system", "Tool '$tool_name' was denied by user.")
+    denial_msg = create_message(prov, "assistant", """I attempted to use the '$tool_name' tool but you denied permission.
+
+Could you let me know:
+1. What would you prefer I do instead?
+2. Why was this tool denied? (so I can avoid similar issues)
+
+I'll wait for your guidance before proceeding.""")
     add_message!(context(agent), denial_msg)
     _set_status!(m, "✗ Denied: $tool_name")
     
@@ -3681,7 +3766,12 @@ function _deny_tool_inline!(m::TuiModel)
     else
         m.waiting_for_tool_permission = false
         m.current_tool_call = nothing
-        _continue_after_tools_inline!(m, agent)
+        try
+            _continue_after_tools_inline!(m, agent)
+        catch e
+            _debug_log("Error in _continue_after_tools_inline! from deny: $e")
+            _set_status!(m, "Error continuing after denial: $(sprint(showerror, e))")
+        end
     end
 end
 
@@ -3915,7 +4005,7 @@ function flooty_sessions_tui(; show_prompt::Bool=false)
         @info "No existing sessions found or error loading: $e"
     end
 
-    app(model; fps=30)
+    app(model; fps=30, default_bindings=false)
 end
 """
     _prepare_tool_execution!(m::TuiModel, tool_name::Symbol, args::Dict{String,Any}) -> Bool

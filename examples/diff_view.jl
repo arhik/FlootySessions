@@ -191,17 +191,18 @@ function wrap_content(content::String, width::Int)::Vector{String}
             push!(lines, remaining)
             break
         end
-        # Find break point (prefer at space)
+        # Find break point (prefer at space) - use character indices
+        chars = collect(remaining)
         break_pos = width
-        for i in width:-1:1
-            if remaining[i] == ' '
+        for i in min(width, length(chars)):-1:1
+            if chars[i] == ' '
                 break_pos = i
                 break
             end
         end
         # If no space found, hard break at width
-        push!(lines, remaining[1:break_pos])
-        remaining = remaining[break_pos+1:end]
+        push!(lines, join(chars[1:break_pos]))
+        remaining = join(chars[break_pos+1:end])
         # Strip leading space for wrapped continuation
         remaining = lstrip(remaining)
     end
@@ -247,15 +248,25 @@ function render_split_view(buf::Buffer, file::DiffFile, state::DiffViewState, x:
     skip = state.scroll_offset
     
     for hunk in file.hunks
-        skip > 0 ? (skip -= 1; continue) : lines >= height && break
-        render_hunk_header(buf, hunk, state, x, cy, half * 2)  # Full width
-        cy += 1
-        lines += 1
+        lines >= height && break
+        
+        # Handle hunk header
+        if skip > 0
+            skip -= 1
+        else
+            render_hunk_header(buf, hunk, state, x, cy, half * 2)
+            cy += 1
+            lines += 1
+        end
         
         for i in 1:length(hunk.lines)
             line = hunk.lines[i]
             line.line_type == LINE_HUNK_HEADER && continue
-            skip > 0 ? (skip -= 1; continue) : lines >= height && break
+            lines >= height && break
+            if skip > 0
+                skip -= 1
+                continue
+            end
             
             if line.line_type == LINE_REMOVED && i < length(hunk.lines) && hunk.lines[i+1].line_type == LINE_ADDED
                 # Modified line: show old and new side by side with matching row heights
@@ -393,14 +404,26 @@ function render_unified_view(buf::Buffer, file::DiffFile, state::DiffViewState, 
     skip = state.scroll_offset
     
     for hunk in file.hunks
-        skip > 0 ? (skip -= 1; continue) : lines >= height && break
-        render_hunk_header(buf, hunk, state, x, cy, state.width)
-        cy += 1
-        lines += 1
+        lines >= height && break
+        
+        # Handle hunk header
+        if skip > 0
+            skip -= 1
+        else
+            render_hunk_header(buf, hunk, state, x, cy, state.width)
+            cy += 1
+            lines += 1
+        end
         
         for line in hunk.lines
             line.line_type == LINE_HUNK_HEADER && continue
-            skip > 0 ? (skip -= 1; continue) : lines >= height && break
+            
+            lines >= height && break
+            
+            if skip > 0
+                skip -= 1
+                continue
+            end
             
             # Word wrap support for unified view
             wrapped = state.word_wrap ? wrap_content(line.content, content_w) : [truncate_string(line.content, content_w)]
