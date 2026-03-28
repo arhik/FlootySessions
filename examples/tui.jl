@@ -164,7 +164,7 @@ function render_widget(buf::Buffer, widget::MessageWidget, x::Int, y::Int, max_y
         elseif msg_role == "assistant"
             Style(bg=ColorRGB(60, 60, 100), fg=ColorRGB(220, 220, 255))
         elseif msg_role == "tool"
-            if occursin("\nError:", msg_content) || startswith(msg_content, "Error:")
+            if occursin("\nError:", msg_content) || startswith(msg_content, "Error:") || occursin("[TOOL DENIED", msg_content)
                 Style(bg=ColorRGB(120, 60, 60), fg=ColorRGB(255, 220, 220))
             else
                 Style(bg=ColorRGB(60, 120, 60), fg=ColorRGB(220, 255, 220))
@@ -179,7 +179,7 @@ function render_widget(buf::Buffer, widget::MessageWidget, x::Int, y::Int, max_y
         elseif msg_role == "assistant"
             Style(bg=ColorRGB(40, 40, 60), fg=ColorRGB(200, 200, 255))
         elseif msg_role == "tool"
-            if occursin("\nError:", msg_content) || startswith(msg_content, "Error:")
+            if occursin("\nError:", msg_content) || startswith(msg_content, "Error:") || occursin("[TOOL DENIED", msg_content)
                 Style(bg=ColorRGB(80, 40, 40), fg=ColorRGB(255, 200, 200))
             else
                 Style(bg=ColorRGB(40, 80, 40), fg=ColorRGB(200, 255, 200))
@@ -3721,14 +3721,15 @@ function _deny_tool_inline!(m::TuiModel)
         # No request was created - just skip this tool
         popfirst!(m.pending_tool_calls)
         prov = provider(agent)
-        denial_msg = create_message(prov, "assistant", """I attempted to use the '$tool_name' tool but you denied permission.
+        args_str = join(["$k=$v" for (k, v) in args], " ")
+        args_trunc = length(args_str) > 50 ? args_str[1:50] * "..." : args_str
+        tool_content = """\$ $tool_name $args_trunc
 
-Could you let me know:
-1. What would you prefer I do instead?
-2. Why was this tool denied? (so I can avoid similar issues)
-
-I'll wait for your guidance before proceeding.""")
-        add_message!(context(agent), denial_msg)
+[TOOL DENIED BY USER - user chose not to execute this tool]"""
+        _debug_log("Denial msg (no request): $tool_content")
+        tool_msg = create_message(prov, "tool", tool_content)
+        add_message!(context(agent), tool_msg)
+        _debug_log("Added tool denial (no request), context now has $(length(get_messages(context(agent)))) messages")
         _set_status!(m, "✗ Denied: $tool_name")
         
         # Move to next or end
@@ -3748,16 +3749,18 @@ I'll wait for your guidance before proceeding.""")
     # Remove from queue
     popfirst!(m.pending_tool_calls)
     
-    # Add denial message as assistant explaining the denial and asking for next steps
+    # Add tool message showing the denial at the TOP (since only first 10 lines show)
     prov = provider(agent)
-    denial_msg = create_message(prov, "assistant", """I attempted to use the '$tool_name' tool but you denied permission.
+    args_str = join(["$k=$v" for (k, v) in args], " ")
+    # TRUNCATED version since we only show first line
+    args_trunc = length(args_str) > 50 ? args_str[1:50] * "..." : args_str
+    tool_content = """\$ $tool_name $args_trunc
 
-Could you let me know:
-1. What would you prefer I do instead?
-2. Why was this tool denied? (so I can avoid similar issues)
-
-I'll wait for your guidance before proceeding.""")
-    add_message!(context(agent), denial_msg)
+[TOOL DENIED BY USER - user chose not to execute this tool]"""
+    _debug_log("Denial msg: $tool_content")
+    tool_msg = create_message(prov, "tool", tool_content)
+    add_message!(context(agent), tool_msg)
+    _debug_log("Added tool denial to context, now has $(length(get_messages(context(agent)))) messages")
     _set_status!(m, "✗ Denied: $tool_name")
     
     # Move to next tool or continue
