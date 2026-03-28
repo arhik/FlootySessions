@@ -17,7 +17,7 @@ mutable struct Session <: AbstractSession
     # Full positional constructor
     Session(id::UUID, name::String, status::SessionStatus, 
             root_agent::Union{AbstractAgent,Nothing}, active_agent_id::Union{UUID,Nothing}, 
-            workspace_folders::Vector{String}, tools::Vector{AbstractTool}, 
+            workspace_folders::Vector{String}, tools::Vector{<:AbstractTool}, 
             metadata::Dict{String,Any}, created_at::DateTime, updated_at::DateTime) = 
         new(id, name, status, root_agent, active_agent_id, workspace_folders, tools, metadata, created_at, updated_at)
 end
@@ -26,9 +26,15 @@ end
 function Session(name::String; 
                  root_agent::Union{AbstractAgent,Nothing}=nothing,
                  workspace_folders::Vector{String}=String[],
-                 tools::Vector{<:AbstractTool}=AbstractTool[])
+                 tools::Vector{<:AbstractTool}=list_default_tools())
     now_time = now()
     active_id = root_agent !== nothing ? root_agent.id : nothing
+    
+    # Pass session tools to root_agent if agent has no tools
+    if root_agent !== nothing && isempty(root_agent.tools) && !isempty(tools)
+        root_agent.tools = tools
+    end
+    
     Session(
         uuid4(),
         name,
@@ -65,6 +71,12 @@ function FlootyAbstract.add_agent_to_session!(s::Session, agent::AbstractAgent)
     else
         add_child!(s.root_agent, agent)
     end
+    
+    # Pass session tools to agent if agent has no tools
+    if isempty(agent.tools) && !isempty(s.tools)
+        agent.tools = s.tools
+    end
+    
     s.updated_at = now()
     s
 end
