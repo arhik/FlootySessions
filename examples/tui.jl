@@ -719,7 +719,7 @@ end
 # ═══════════════════════════════════════════════════════════════════════
 # Modal States
 # ═══════════════════════════════════════════════════════════════════════
-@enum ModalState MODAL_NONE MODAL_DELETE_CONFIRM MODAL_SESSION_SWITCHER MODAL_MODEL_SELECT MODAL_DIFF_VIEW MODAL_SYSTEM_PROMPT MODAL_TOOL_PERMISSION MODAL_EDIT_DIFF
+@enum ModalState MODAL_NONE MODAL_DELETE_CONFIRM MODAL_SESSION_SWITCHER MODAL_MODEL_SELECT MODAL_DIFF_VIEW MODAL_SYSTEM_PROMPT MODAL_TOOL_PERMISSION MODAL_EDIT_DIFF MODAL_TOOL_VIEW
 
 # ═══════════════════════════════════════════════════════════════════════
 # TUI Model
@@ -797,6 +797,11 @@ end
     diff_view_old::String = ""      # Original file content
     diff_view_new::String = ""      # New file content
     diff_view_tool_call::Any = nothing  # Tool call to execute if confirmed
+
+    # Tool view state (for viewing full tool messages in modal)
+    tool_view_content::String = ""  # Full tool message content being viewed
+    tool_view_role::String = "tool"  # Role of message being viewed
+    tool_view_scroll::Int = 0       # Scroll offset for tool view modal
     diff_viewer::Any = nothing      # DiffView.DiffViewer instance
 
     # Model selection
@@ -1398,6 +1403,8 @@ function _handle_modal_key!(m::TuiModel, evt::KeyEvent)
         else
             _debug_log("MODAL_DIFF_VIEW: unhandled key $(evt.key) char=$(evt.key == :char ? evt.char : '-')")
         end
+    elseif m.modal == MODAL_TOOL_VIEW
+        _render_tool_view_modal!(m, buf, area)
     elseif m.modal == MODAL_EDIT_DIFF
         if evt.key == :char && evt.char == 'y'
             # Confirm edit save
@@ -3049,6 +3056,8 @@ function _render_modal!(m::TuiModel, buf::Buffer, area::Rect)
         _render_delete_modal!(m, buf, area)
     elseif m.modal == MODAL_MODEL_SELECT
         _render_model_select_modal!(m, buf, area)
+    elseif m.modal == MODAL_TOOL_VIEW
+        _render_tool_view_modal!(m, buf, area)
     elseif m.modal == MODAL_EDIT_DIFF
         _render_edit_diff_modal!(m, buf, area)
     elseif m.modal == MODAL_SYSTEM_PROMPT
@@ -4396,3 +4405,63 @@ function generate_unified_diff(old_content::String, new_content::String, path::S
     String(take!(io))
 end
 
+
+
+function _render_tool_view_modal!(m::TuiModel, buf::Buffer, area::Rect)
+    # Title
+    title = " Tool Message Content "
+    title_style = Style(fg=ColorRGB(100, 255, 100), bold=true)
+
+    # Calculate modal dimensions
+    modal_width = min(120, area.width - 4)
+    modal_height = min(45, area.height - 4)
+    modal_rect = center(area, modal_width, modal_height)
+
+    # Fill background
+    for y in modal_rect.y:modal_rect.y + modal_rect.height - 1
+        for x in modal_rect.x:modal_rect.x + modal_rect.width - 1
+            set_string!(buf, x, y, " ", Style(bg=ColorRGB(20, 20, 25)))
+        end
+    end
+
+    # Draw border
+    block = Block(
+        title=title,
+        border_style=Style(fg=Color256(245), bg=ColorRGB(20, 20, 25)),
+        title_style=title_style,
+        box=BOX_HEAVY,
+    )
+    content = render(block, modal_rect, buf)
+
+    # Render content
+    lines = split(m.tool_view_content, '\n')
+    max_lines = content.height - 3
+    start_idx = m.tool_view_scroll + 1
+    
+    for (i, line) in enumerate(lines[start_idx:min(start_idx + max_lines - 1, length(lines))])
+        y = content.y + i - 1
+        y >= content.y + content.height - 2 && break
+        
+        # Truncate long lines
+        display_line = length(line) > content.width - 2 ? line[1:content.width-5] * "..." : line
+        
+        # Style based on content
+        style = if startswith(line, "> ")
+            Style(fg=ColorRGB(100, 150, 255))
+        elseif startswith(line, "<")
+            Style(fg=ColorRGB(255, 150, 100))
+        elseif contains(line, "[TOOL DENIED")
+            Style(fg=ColorRGB(255, 100, 100), bold=true)
+        else
+            Style(fg=ColorRGB(200, 200, 200))
+        end
+        
+        set_string!(buf, content.x + 1, y, display_line, style)
+    end
+
+    # Help text
+    help_y = content.y + content.height - 2
+    help_text = "j/k/↑/↓:scroll PgUp/PgDn:page q/Esc:close"
+    help_x = content.x + div(content.width - length(help_text), 2)
+    set_string!(buf, help_x, help_y, help_text, Style(fg=ColorRGB(255, 255, 255), bold=true, bg=ColorRGB(20, 20, 25)))
+end
