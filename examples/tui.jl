@@ -807,7 +807,7 @@ end
     # Model selection
     available_models::Vector{String} = [
         "nemotron-3-nano:30b-cloud",
-        "qwen3:4b",
+        "qwen3:0.8b",
         "devstral-small-2:24b-cloud",
         "llama3.2:3b",
         "mistral:7b"
