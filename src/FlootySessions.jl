@@ -17,7 +17,7 @@ export session_id, session_name, session_status, session_agents, session_workspa
 export session_context, session_created_at, session_updated_at, session_tools
 export set_active_agent!
 export list_default_tools
-export get_messages, add_message!
+export get_messages, add_message!, set_repl_executor!
 
 # Permission system exports
 export ToolPermission, PermissionStatus, PERMISSION_PENDING, PERMISSION_GRANTED, PERMISSION_DENIED, PERMISSION_REVOKED
@@ -494,6 +494,48 @@ function default_repl_executor(code::String)
     
     (captured.value, captured.output)
 end
+
+function handle_repl(args::Dict{String,Any}; context=nothing)
+    code = get(args, "code", "")
+    
+    if isempty(strip(code))
+        return FlootyAbstract.ToolResult(true, "", nothing)
+    end
+    
+    # Use custom executor if registered (e.g., FlootyWebUIEditor xterm.js), else fallback
+    executor = REPL_EXECUTOR[] !== nothing ? REPL_EXECUTOR[] : default_repl_executor
+    
+    try
+        success, output = executor(code)
+        
+        if success
+            return FlootyAbstract.ToolResult(true, output, nothing)
+        else
+            # Failure: output contains error message
+            if isempty(output)
+                output = "Execution failed: unknown error"
+            end
+            return FlootyAbstract.ToolResult(false, "", output)
+        end
+    catch e
+        err_msg = sprint(showerror, e)
+        err_type = string(typeof(e))
+        
+        # Classify error for better agent understanding
+        error_hint = ""
+        if occursin("ParseError", err_type)
+            error_hint = " Multiple lines must be complete expressions, or wrap in begin...end"
+        elseif occursin("UndefVarError", err_type)
+            error_hint = " Variable may not persist between calls. Define and use in same block."
+        elseif occursin("MethodError", err_type)
+            error_hint = " Function may not exist. Define before calling."
+        end
+        
+        full_error = "[$err_type] $err_msg$error_hint"
+        return FlootyAbstract.ToolResult(false, "", full_error)
+    end
+end
+
 function __init__()
     FlootyAbstract.register_tool_handler!("pwd", handle_pwd)
     FlootyAbstract.register_tool_handler!("ls", handle_ls)
@@ -503,6 +545,7 @@ function __init__()
     FlootyAbstract.register_tool_handler!("diffview", handle_diffview)
     FlootyAbstract.register_tool_handler!("web_search", handle_web_search)
     FlootyAbstract.register_tool_handler!("web_fetch", handle_web_fetch)
+    FlootyAbstract.register_tool_handler!("repl", handle_repl)
 end
 
 end # module FlootySessions
