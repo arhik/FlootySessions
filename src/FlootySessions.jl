@@ -6,7 +6,8 @@ import FlootyAbstract: get_messages, add_message!
 using FlootyAgents: Agent, descendants, add_child!, create_subagent, SimpleStack
 using FlootyBase: Tool, ToolParameter, pwd_tool, ls_tool, read_tool, write_tool, shell_tool, diffview_tool, list_default_tools
 using FlootyContextManager
-using FlootyStreams: OllamaTool, OllamaFunction
+using FlootyStreams: OllamaTool, OllamaFunction, web_search, web_fetch
+using FlootyAbstract: AbstractSession, AbstractAgent, AbstractTool, SessionStatus, SESSION_ACTIVE, SESSION_PAUSED, SESSION_CLOSED, AbstractPersistable, AbstractPersistenceBackend, save!, load, delete!, list, search_results, result_title, result_url, result_content, fetch_title, fetch_content
 using StructTypes
 using UUIDs
 using Dates
@@ -434,6 +435,65 @@ function set_permission_mode!(session::Session, mode::String)
     mode
 end
 
+# Web Search Handlers
+function handle_web_search(args::Dict{String,Any}; context=nothing)
+    query = get(args, "query", "")
+    max_results = get(args, "max_results", 5)
+    result = web_search(query; max_results=max_results)
+    text = join(["$(result_title(r))\n$(result_url(r))\n$(first(result_content(r), 500))" 
+                 for r in search_results(result)], "\n\n")
+    FlootyAbstract.ToolResult(text)
+end
+
+function handle_web_fetch(args::Dict{String,Any}; context=nothing)
+    url = get(args, "url", "")
+    result = web_fetch(url)
+    text = "$(fetch_title(result))\n\n$(fetch_content(result))"
+    FlootyAbstract.ToolResult(text)
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# REPL Tool Handler
+# The actual execution can be delegated via callback, or uses IOCapture fallback
+# ═══════════════════════════════════════════════════════════════════════
+
+const REPL_EXECUTOR = Ref{Union{Function,Nothing}}(nothing)
+
+"""
+    set_repl_executor!(executor::Function)
+
+Register a function to execute Julia code in the REPL.
+The executor should accept (code::String) and return (success::Bool, output::String).
+Called by FlootyWebUIEditor when it initializes for xterm.js integration.
+"""
+function set_repl_executor!(executor::Function)
+    REPL_EXECUTOR[] = executor
+end
+
+"""
+    default_repl_executor(code::String) -> (Bool, String)
+
+Default executor using IOCapture in the current process.
+"""
+function default_repl_executor(code::String)
+    isempty(strip(code)) && return (true, "")
+    
+    captured = IOCapture.capture(color=false) do
+        try
+            result = Core.eval(Main, Meta.parse(code))
+            if result !== nothing
+                println(result)
+            end
+            true
+        catch e
+            showerror(stderr, e, catch_backtrace())
+            println(stderr)
+            false
+        end
+    end
+    
+    (captured.value, captured.output)
+end
 function __init__()
     FlootyAbstract.register_tool_handler!("pwd", handle_pwd)
     FlootyAbstract.register_tool_handler!("ls", handle_ls)
@@ -441,6 +501,8 @@ function __init__()
     FlootyAbstract.register_tool_handler!("write", handle_write)
     FlootyAbstract.register_tool_handler!("shell", handle_shell)
     FlootyAbstract.register_tool_handler!("diffview", handle_diffview)
+    FlootyAbstract.register_tool_handler!("web_search", handle_web_search)
+    FlootyAbstract.register_tool_handler!("web_fetch", handle_web_fetch)
 end
 
 end # module FlootySessions
