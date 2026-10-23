@@ -75,7 +75,6 @@ Pkg.add(url="https://github.com/yourusername/FlootySessions.jl")
 | `UUIDs` | Unique identifiers |
 | `Dates` | Timestamp management |
 | `IOCapture` | Tool output capture |
-| `DiffUtils` | Diff view functionality |
 
 ---
 
